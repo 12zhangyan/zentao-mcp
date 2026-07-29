@@ -304,8 +304,15 @@ test('禅道 21.x 我的任务接口可解包 data 字符串和对象型任务�
         response.end(JSON.stringify({ data: JSON.stringify({ rand: 123 }) }));
         return;
       }
+      if (request.method === 'GET' && request.url === '/zentao/user-refreshRandom.json') {
+        response.end('456');
+        return;
+      }
       if (request.method === 'POST' && request.url === '/zentao/user-login.json') {
-        response.end(JSON.stringify({ status: 'success' }));
+        response.end(JSON.stringify({
+          status: 'success',
+          user: { account: 'tester' },
+        }));
         return;
       }
       if (request.method === 'GET' && request.url === '/zentao/my-work-task-assignedTo.json') {
@@ -335,10 +342,10 @@ test('禅道 21.x 我的任务接口可解包 data 字符串和对象型任务�
     },
   );
 
-  assert.equal(requests.length, 3);
-  const loginBody = Object.fromEntries(new URLSearchParams(requests[1].body));
+  assert.equal(requests.length, 4);
+  const loginBody = Object.fromEntries(new URLSearchParams(requests[2].body));
   assert.equal(loginBody.account, 'tester');
-  assert.equal(loginBody.verifyRand, '123');
+  assert.equal(loginBody.verifyRand, '456');
   assert.equal(loginBody.password.length, 32);
   assert.notEqual(loginBody.password, 'plain-secret');
 });
@@ -399,6 +406,328 @@ test('拒绝将禅道请求重定向到外部来源', async () => {
         password: 'plain-secret',
       });
       await assert.rejects(client.getProducts(5), /跨源 HTTP 重定向/);
+    },
+  );
+});
+
+test('文档树和详情使用 21.7.4 官方 REST 接口并返回结构化数据', async () => {
+  const requested = [];
+
+  await withServer(
+    (request, response) => {
+      requested.push(request.url);
+      response.setHeader('Content-Type', 'application/json');
+      if (request.method === 'POST' && request.url === '/zentao/api.php/v1/tokens') {
+        response.end(JSON.stringify({ token: 'test-token' }));
+        return;
+      }
+      if (
+        request.method === 'GET'
+        && request.url === '/zentao/api.php/v1/doclibs?type=product&objectID=17'
+      ) {
+        response.end(JSON.stringify({ libs: [{ id: 73, name: '示例文档库' }] }));
+        return;
+      }
+      if (request.method === 'GET' && request.url === '/zentao/api.php/v1/doclibs/73') {
+        response.end(JSON.stringify({
+          docs: [{ id: 3, lib: 73, title: '示例文档', type: 'text' }],
+        }));
+        return;
+      }
+      if (request.method === 'GET' && request.url === '/zentao/api.php/v1/docs/3') {
+        response.end(JSON.stringify({
+          id: 3,
+          lib: 73,
+          title: '示例文档',
+          type: 'text',
+          content: '<p>只读内容</p>',
+        }));
+        return;
+      }
+      response.statusCode = 404;
+      response.end(JSON.stringify({ error: 'not found' }));
+    },
+    async (url) => {
+      const client = new ZentaoClient({
+        url,
+        account: 'tester',
+        password: 'fake-secret',
+      });
+
+      const tree = await client.getDocSpaceData('product', 17);
+      assert.equal(tree.spaceID, 17);
+      assert.equal(tree.libs.length, 1);
+      assert.equal(tree.libs[0].id, 73);
+      assert.equal(tree.libs[0].type, 'product');
+      assert.equal(tree.libs[0].product, 17);
+      assert.equal(tree.docs[0].id, 3);
+
+      const doc = await client.getDoc(3);
+      assert.equal(doc.id, 3);
+      assert.equal(doc.title, '示例文档');
+    },
+  );
+
+  assert.deepEqual(requested, [
+    '/zentao/api.php/v1/tokens',
+    '/zentao/api.php/v1/doclibs?type=product&objectID=17',
+    '/zentao/api.php/v1/doclibs/73',
+    '/zentao/api.php/v1/docs/3',
+  ]);
+});
+
+test('文档 REST 返回 HTML 时显式失败，不把页面当作业务数据', async () => {
+  await withServer(
+    (request, response) => {
+      if (request.method === 'POST' && request.url === '/zentao/api.php/v1/tokens') {
+        response.setHeader('Content-Type', 'application/json');
+        response.end(JSON.stringify({ token: 'test-token' }));
+        return;
+      }
+      if (request.url === '/zentao/api.php/v1/doclibs?type=product&objectID=17') {
+        response.setHeader('Content-Type', 'text/html');
+        response.end('<!DOCTYPE html><title>首页 - 禅道</title>');
+        return;
+      }
+      response.statusCode = 404;
+      response.end();
+    },
+    async (url) => {
+      const client = new ZentaoClient({
+        url,
+        account: 'tester',
+        password: 'fake-secret',
+      });
+      await assert.rejects(
+        client.getDocSpaceData('product', 17),
+        /文档库接口返回了非结构化数据/,
+      );
+    },
+  );
+});
+
+test('文档详情 REST 返回 HTML 时显式失败，不把页面当作业务数据', async () => {
+  await withServer(
+    (request, response) => {
+      if (request.method === 'POST' && request.url === '/zentao/api.php/v1/tokens') {
+        response.setHeader('Content-Type', 'application/json');
+        response.end(JSON.stringify({ token: 'test-token' }));
+        return;
+      }
+      if (request.url === '/zentao/api.php/v1/docs/3') {
+        response.setHeader('Content-Type', 'text/html');
+        response.end('<!DOCTYPE html><title>首页 - 禅道</title>');
+        return;
+      }
+      response.statusCode = 404;
+      response.end();
+    },
+    async (url) => {
+      const client = new ZentaoClient({
+        url,
+        account: 'tester',
+        password: 'fake-secret',
+      });
+      await assert.rejects(
+        client.getDoc(3),
+        /文档 #3 接口返回了非结构化详情/,
+      );
+    },
+  );
+});
+
+test('legacy 响应为 HTML 时显式失败，不把 HTML 当作任务数据', async () => {
+  await withServer(
+    (request, response) => {
+      if (request.method === 'GET' && request.url === '/zentao/user-login.json') {
+        response.setHeader('Content-Type', 'application/json');
+        response.setHeader('Set-Cookie', 'zentaosid=sid; Path=/');
+        response.end(JSON.stringify({ data: JSON.stringify({ rand: 123 }) }));
+        return;
+      }
+      if (request.method === 'GET' && request.url === '/zentao/user-refreshRandom.json') {
+        response.setHeader('Content-Type', 'text/plain');
+        response.end('456');
+        return;
+      }
+      if (request.method === 'POST' && request.url === '/zentao/user-login.json') {
+        response.setHeader('Content-Type', 'application/json');
+        response.end(JSON.stringify({
+          status: 'success',
+          user: { account: 'tester' },
+        }));
+        return;
+      }
+      if (request.url === '/zentao/my-work-task-assignedTo.json') {
+        response.setHeader('Content-Type', 'text/html');
+        response.end('<!DOCTYPE html><title>首页 - 禅道</title>');
+        return;
+      }
+      response.statusCode = 404;
+      response.end();
+    },
+    async (url) => {
+      const client = new ZentaoClient({
+        url,
+        account: 'tester',
+        password: 'fake-secret',
+      });
+      await assert.rejects(
+        client.getMyTasks('assignedTo', 5),
+        /内置 API 返回了非 JSON 响应/,
+      );
+    },
+  );
+});
+
+test('legacy 登录包装仍是登录页时不得误判成功', async () => {
+  await withServer(
+    (request, response) => {
+      response.setHeader('Content-Type', 'application/json');
+      if (request.method === 'GET' && request.url === '/zentao/user-login.json') {
+        response.setHeader('Set-Cookie', 'zentaosid=sid; Path=/');
+        response.end(JSON.stringify({ data: JSON.stringify({ rand: 123 }) }));
+        return;
+      }
+      if (request.method === 'GET' && request.url === '/zentao/user-refreshRandom.json') {
+        response.end('456');
+        return;
+      }
+      if (request.method === 'POST' && request.url === '/zentao/user-login.json') {
+        response.end(JSON.stringify({
+          status: 'success',
+          data: JSON.stringify({ title: '用户登录', rand: 789 }),
+        }));
+        return;
+      }
+      response.statusCode = 404;
+      response.end(JSON.stringify({ error: 'not found' }));
+    },
+    async (url) => {
+      const client = new ZentaoClient({
+        url,
+        account: 'tester',
+        password: 'fake-secret',
+      });
+      await assert.rejects(
+        client.getMyTasks('assignedTo', 5),
+        /内置 API 登录失败/,
+      );
+    },
+  );
+});
+
+test('执行任务接口返回表单包装时回退任务搜索并按 execution 过滤', async () => {
+  const requested = [];
+
+  await withServer(
+    (request, response) => {
+      requested.push(request.url);
+      response.setHeader('Content-Type', 'application/json');
+      if (request.method === 'POST' && request.url === '/zentao/api.php/v1/tokens') {
+        response.end(JSON.stringify({ token: 'test-token' }));
+        return;
+      }
+      if (
+        request.method === 'GET'
+        && request.url === '/zentao/api.php/v1/executions/313/tasks?limit=5'
+      ) {
+        response.end(JSON.stringify({
+          status: 'success',
+          data: '<form><title>添加执行</title></form>',
+        }));
+        return;
+      }
+      if (
+        request.method === 'GET'
+        && request.url === '/zentao/api.php/v1/tasks?search=1&limit=100&page=1&order=id_desc'
+      ) {
+        response.end(JSON.stringify({
+          page: 1,
+          total: 3,
+          limit: 100,
+          tasks: [
+            { id: 68675, execution: 999, name: '其他执行任务' },
+            { id: 68674, execution: 313, name: '目标任务' },
+            { id: 68673, execution: { id: 313 }, name: '同执行任务' },
+          ],
+        }));
+        return;
+      }
+      response.statusCode = 404;
+      response.end(JSON.stringify({ error: 'not found' }));
+    },
+    async (url) => {
+      const client = new ZentaoClient({
+        url,
+        account: 'tester',
+        password: 'fake-secret',
+      });
+      const tasks = await client.getTasks(313, 5);
+      assert.deepEqual(tasks.map((task) => task.id), [68674, 68673]);
+    },
+  );
+
+  assert.deepEqual(requested, [
+    '/zentao/api.php/v1/tokens',
+    '/zentao/api.php/v1/executions/313/tasks?limit=5',
+    '/zentao/api.php/v1/tasks?search=1&limit=100&page=1&order=id_desc',
+  ]);
+});
+
+test('执行任务回退接口仍非任务列表时给出业务错误', async () => {
+  await withServer(
+    (request, response) => {
+      response.setHeader('Content-Type', 'application/json');
+      if (request.method === 'POST' && request.url === '/zentao/api.php/v1/tokens') {
+        response.end(JSON.stringify({ token: 'test-token' }));
+        return;
+      }
+      response.end(JSON.stringify({
+        status: 'success',
+        data: '<form><title>添加执行</title></form>',
+      }));
+    },
+    async (url) => {
+      const client = new ZentaoClient({
+        url,
+        account: 'tester',
+        password: 'fake-secret',
+      });
+      await assert.rejects(
+        client.getTasks(313, 5),
+        /任务搜索接口返回了非任务列表/,
+      );
+    },
+  );
+});
+
+test('项目详情 403 转换为包含 projectID 的可读 ACL 错误', async () => {
+  await withServer(
+    (request, response) => {
+      response.setHeader('Content-Type', 'application/json');
+      if (request.method === 'POST' && request.url === '/zentao/api.php/v1/tokens') {
+        response.end(JSON.stringify({ token: 'test-token' }));
+        return;
+      }
+      if (request.url === '/zentao/api.php/v1/projects/312') {
+        response.statusCode = 403;
+        response.end(JSON.stringify({ error: 'Access not allowed' }));
+        return;
+      }
+      response.statusCode = 404;
+      response.end(JSON.stringify({ error: 'not found' }));
+    },
+    async (url) => {
+      const client = new ZentaoClient({
+        url,
+        account: 'tester',
+        password: 'fake-secret',
+      });
+      await assert.rejects(
+        client.getProject(312),
+        /项目 #312 无权查看（禅道返回 HTTP 403）/,
+      );
     },
   );
 });

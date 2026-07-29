@@ -16,7 +16,7 @@ test('默认配置位于当前用户目录，不依赖仓库文件', () => {
   assert.equal(resolveConfigPath({}, home), defaultConfigPath(home));
 });
 
-test('可读取本地配置，并兼容 zentao-weekly 的配置结构', () => {
+test('可读取本地配置，并兼容 zentao 节点配置结构', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zentao-mcp-config-'));
   const configPath = path.join(directory, 'config.json');
   fs.writeFileSync(configPath, JSON.stringify({
@@ -120,7 +120,7 @@ test('拒绝越界的超时和分页参数', () => {
   }
 });
 
-test('专用配置不存在时可复用当前用户的 zentao-weekly 本地配置', () => {
+test('专用配置不存在时不得读取 zentao-weekly 凭据', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zentao-mcp-home-'));
   const weeklyDirectory = path.join(home, '.zentao-weekly');
   fs.mkdirSync(weeklyDirectory);
@@ -133,10 +133,10 @@ test('专用配置不存在时可复用当前用户的 zentao-weekly 本地配�
   }));
 
   try {
-    const config = loadZentaoConfig({}, home);
-    assert.equal(config.url, 'http://zentao.example.local/zentao');
-    assert.equal(config.account, 'tester');
-    assert.equal(config.password, 'weekly-local-secret');
+    assert.throws(
+      () => loadZentaoConfig({}, home),
+      /未找到禅道本地配置/,
+    );
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

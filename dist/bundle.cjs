@@ -33258,12 +33258,7 @@ function resolveConfigPath(env = process.env, homeDir = import_node_os.default.h
   return import_node_path.default.resolve(configuredPath);
 }
 function loadZentaoConfig(env = process.env, homeDir = import_node_os.default.homedir()) {
-  let configPath = resolveConfigPath(env, homeDir);
-  if (!env.ZENTAO_CONFIG_PATH?.trim() && !import_node_fs.default.existsSync(configPath)) {
-    const weeklyConfigPath = import_node_path.default.join(homeDir, ".zentao-weekly", "config.json");
-    if (import_node_fs.default.existsSync(weeklyConfigPath))
-      configPath = weeklyConfigPath;
-  }
+  const configPath = resolveConfigPath(env, homeDir);
   let raw;
   try {
     raw = import_node_fs.default.readFileSync(configPath, "utf8");
@@ -38454,6 +38449,9 @@ var ZentaoClient = class {
   isNotFound(error2) {
     return axios_default.isAxiosError(error2) && error2.response?.status === 404;
   }
+  isForbidden(error2) {
+    return axios_default.isAxiosError(error2) && error2.response?.status === 403;
+  }
   /** 将 MCP 请求的取消信号安全地传递到当前异步调用链中的 HTTP 请求。 */
   async withAbortSignal(signal, operation) {
     if (!signal)
@@ -39069,6 +39067,9 @@ var ZentaoClient = class {
     } catch (error2) {
       if (this.isNotFound(error2))
         return null;
+      if (this.isForbidden(error2)) {
+        throw new Error(`\u9879\u76EE #${projectID} \u65E0\u6743\u67E5\u770B\uFF08\u7985\u9053\u8FD4\u56DE HTTP 403\uFF09`);
+      }
       throw error2;
     }
   }
@@ -39138,8 +39139,79 @@ var ZentaoClient = class {
    */
   async getTasks(executionID, limit = 100) {
     await this.ensureLogin();
-    const response = await this.http.get(`/api.php/v1/executions/${executionID}/tasks?limit=${limit}`);
-    return response.data.data || response.data.tasks || [];
+    try {
+      const response = await this.http.get(`/api.php/v1/executions/${executionID}/tasks?limit=${limit}`);
+      const tasks = this.extractTaskList(response.data);
+      if (tasks && tasks.every((task) => {
+        const taskExecutionID = this.getTaskExecutionID(task);
+        return taskExecutionID === 0 || taskExecutionID === executionID;
+      })) {
+        return tasks.slice(0, limit);
+      }
+    } catch (error2) {
+      const status = axios_default.isAxiosError(error2) ? error2.response?.status : void 0;
+      if (status !== 400 && status !== 403 && status !== 404)
+        throw error2;
+    }
+    return this.getTasksBySearch(executionID, limit);
+  }
+  /**
+   * 禅道 21.7.x 在 Token 会话下可能把执行任务路由重定向到“添加执行”页。
+   * 此时使用同版本官方 tasks 搜索接口分页读取，再按 execution ID 过滤。
+   */
+  async getTasksBySearch(executionID, limit) {
+    const configuredPageSize = this.config.maxPageSize ?? 100;
+    const pageSize = Math.min(configuredPageSize, Math.max(Math.min(100, configuredPageSize), limit * 20));
+    const maxPages = 20;
+    const matches = [];
+    let total = Number.POSITIVE_INFINITY;
+    let scannedAll = false;
+    for (let page = 1; page <= maxPages && matches.length < limit; page += 1) {
+      const response = await this.http.get(`/api.php/v1/tasks?search=1&limit=${pageSize}&page=${page}&order=id_desc`);
+      const tasks = this.extractTaskList(response.data);
+      if (!tasks) {
+        throw new Error(`\u6267\u884C #${executionID} \u7684\u4EFB\u52A1\u641C\u7D22\u63A5\u53E3\u8FD4\u56DE\u4E86\u975E\u4EFB\u52A1\u5217\u8868`);
+      }
+      const responseTotal = Number(response.data.total);
+      if (Number.isFinite(responseTotal) && responseTotal >= 0)
+        total = responseTotal;
+      for (const task of tasks) {
+        if (this.getTaskExecutionID(task) === executionID)
+          matches.push(task);
+        if (matches.length >= limit)
+          break;
+      }
+      const scanned = page * pageSize;
+      if (tasks.length < pageSize || scanned >= total) {
+        scannedAll = true;
+        break;
+      }
+    }
+    if (!scannedAll && matches.length === 0) {
+      throw new Error(`\u6267\u884C #${executionID} \u7684\u5D4C\u5957\u4EFB\u52A1\u63A5\u53E3\u4E0D\u53EF\u7528\uFF0C\u4E14\u53EA\u8BFB\u4EFB\u52A1\u641C\u7D22\u5728\u626B\u63CF\u4E0A\u9650\u5185\u672A\u627E\u5230\u4EFB\u52A1`);
+    }
+    return matches.slice(0, limit);
+  }
+  extractTaskList(payload) {
+    let candidate = payload;
+    if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+      const object3 = candidate;
+      if ("tasks" in object3) {
+        candidate = object3.tasks;
+      } else if ("data" in object3 && object3.data && typeof object3.data === "object") {
+        return this.extractTaskList(object3.data);
+      }
+    }
+    if (!Array.isArray(candidate))
+      return null;
+    if (!candidate.every((task) => task && typeof task === "object" && Number.isFinite(Number(task.id)) && typeof task.name === "string")) {
+      return null;
+    }
+    return candidate;
+  }
+  getTaskExecutionID(task) {
+    const execution = task.execution;
+    return Number(execution && typeof execution === "object" ? execution.id ?? 0 : execution ?? 0);
   }
   /**
    * 获取当前用户的任务列表，兼容禅道 21.x my-work 页面 JSON 接口。
@@ -39825,7 +39897,22 @@ var ZentaoClient = class {
       });
       this.handleLegacyCookies(loginPageResp);
       const loginPage = this.unwrapLegacyPayload(loginPageResp.data);
-      const verifyRand = String(loginPage.rand ?? "");
+      let verifyRand = String(loginPage.rand ?? "");
+      try {
+        const refreshRandResp = await this.http.get("/user-refreshRandom.json", {
+          headers: {
+            "X-Requested-With": "XMLHttpRequest",
+            "Cookie": this.legacyCookies.join("; ")
+          }
+        });
+        this.handleLegacyCookies(refreshRandResp);
+        const refreshedRand = String(refreshRandResp.data ?? "").trim();
+        if (/^\d+$/.test(refreshedRand))
+          verifyRand = refreshedRand;
+      } catch (error2) {
+        if (!this.isNotFound(error2))
+          throw error2;
+      }
       const password = verifyRand ? this.md5(`${this.md5(this.config.password)}${verifyRand}`) : this.config.password;
       const loginResp = await this.http.post("/user-login.json", new URLSearchParams({
         account: this.config.account,
@@ -39843,7 +39930,16 @@ var ZentaoClient = class {
       });
       this.handleLegacyCookies(loginResp);
       const loginData = typeof loginResp.data === "string" ? JSON.parse(loginResp.data) : loginResp.data;
-      const loginSucceeded = loginData.result === "success" || loginData.status === "success" || Boolean(loginData.user) || Boolean(loginData.userID);
+      let nestedLoginData = loginData.data;
+      if (typeof nestedLoginData === "string") {
+        try {
+          nestedLoginData = JSON.parse(nestedLoginData);
+        } catch {
+          nestedLoginData = void 0;
+        }
+      }
+      const returnedLoginPage = Boolean(nestedLoginData && typeof nestedLoginData === "object" && "rand" in nestedLoginData);
+      const loginSucceeded = !returnedLoginPage && (loginData.result === "success" || loginData.status === "success" || Boolean(loginData.user) || Boolean(loginData.userID));
       if (!loginSucceeded) {
         const status = typeof loginData.status === "string" ? loginData.status : "missing";
         const result = typeof loginData.result === "string" ? loginData.result : "missing";
@@ -39903,20 +39999,26 @@ var ZentaoClient = class {
   /** 解包禅道 Web JSON 常见的 data 字符串/对象包装。 */
   unwrapLegacyPayload(payload) {
     if (typeof payload === "string") {
+      let parsed;
       try {
-        return this.unwrapLegacyPayload(JSON.parse(payload));
+        parsed = JSON.parse(payload);
       } catch {
-        return payload;
+        throw new Error("\u5185\u7F6E API \u8FD4\u56DE\u4E86\u975E JSON \u54CD\u5E94\uFF08\u53EF\u80FD\u662F\u767B\u5F55\u5931\u6548\u3001\u6743\u9650\u4E0D\u8DB3\u6216\u63A5\u53E3\u8DEF\u7531\u4E0D\u517C\u5BB9\uFF09");
       }
+      return this.unwrapLegacyPayload(parsed);
     }
-    if (payload && typeof payload === "object" && "data" in payload) {
-      const data = payload.data;
+    if (payload && typeof payload === "object") {
+      const object3 = payload;
+      if (object3.result === false || object3.result === "fail" || object3.status === "fail") {
+        const message = typeof object3.message === "string" ? object3.message : "\u8BF7\u6C42\u5931\u8D25";
+        const suffix = object3.load === "login" ? "\uFF08\u4F1A\u8BDD\u5DF2\u5931\u6548\uFF09" : "";
+        throw new Error(`\u5185\u7F6E API ${message}${suffix}`);
+      }
+      if (!("data" in object3))
+        return payload;
+      const data = object3.data;
       if (typeof data === "string") {
-        try {
-          return JSON.parse(data);
-        } catch {
-          throw new Error("\u5185\u7F6E API \u8FD4\u56DE\u4E86\u65E0\u6548 JSON");
-        }
+        return this.unwrapLegacyPayload(data);
       }
       if (data && typeof data === "object")
         return data;
@@ -39974,8 +40076,28 @@ var ZentaoClient = class {
    * @returns 文档空间数据
    */
   async getDocSpaceData(type, spaceID) {
-    const data = await this.legacyGet(`/index.php?m=doc&f=ajaxGetSpaceData&type=${type}&spaceID=${spaceID}&picks=`);
-    return data;
+    await this.ensureLogin();
+    const libsResponse = await this.http.get(`/api.php/v1/doclibs?type=${type}&objectID=${spaceID}`);
+    if (!Array.isArray(libsResponse.data.libs)) {
+      throw new Error(`${type === "product" ? "\u4EA7\u54C1" : "\u9879\u76EE"} #${spaceID} \u7684\u6587\u6863\u5E93\u63A5\u53E3\u8FD4\u56DE\u4E86\u975E\u7ED3\u6784\u5316\u6570\u636E`);
+    }
+    const libs = libsResponse.data.libs.map((lib) => ({
+      ...lib,
+      type,
+      [type]: spaceID
+    }));
+    const trees = await Promise.all(libs.map(async (lib) => {
+      const response = await this.http.get(`/api.php/v1/doclibs/${lib.id}`);
+      if (!Array.isArray(response.data.docs)) {
+        throw new Error(`\u6587\u6863\u5E93 #${lib.id} \u8FD4\u56DE\u4E86\u975E\u7ED3\u6784\u5316\u6587\u6863\u6811`);
+      }
+      return response.data.docs;
+    }));
+    return {
+      spaceID,
+      libs,
+      docs: trees.flat()
+    };
   }
   /**
    * 获取文档详情
@@ -39984,9 +40106,18 @@ var ZentaoClient = class {
    * @returns 文档详情
    */
   async getDoc(docID, version2 = 0) {
+    if (version2 !== 0) {
+      return this.legacyGet(`/doc-ajaxGetDoc-${docID}-${version2}.html`);
+    }
+    await this.ensureLogin();
     try {
-      const data = await this.legacyGet(`/index.php?m=doc&f=ajaxGetDoc&docID=${docID}&version=${version2}`);
-      return data || null;
+      const response = await this.http.get(`/api.php/v1/docs/${docID}`);
+      const payload = response.data;
+      const data = payload !== null && typeof payload === "object" && "data" in payload ? payload.data : payload;
+      if (!data || typeof data !== "object" || !Number.isFinite(Number(data.id)) || typeof data.title !== "string") {
+        throw new Error(`\u6587\u6863 #${docID} \u63A5\u53E3\u8FD4\u56DE\u4E86\u975E\u7ED3\u6784\u5316\u8BE6\u60C5`);
+      }
+      return data;
     } catch (error2) {
       if (this.isNotFound(error2))
         return null;

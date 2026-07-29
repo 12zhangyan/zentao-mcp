@@ -30,6 +30,7 @@ export declare class ZentaoClient {
     /** 记录不包含连接凭据的请求错误。 */
     private logRequestError;
     private isNotFound;
+    private isForbidden;
     /** 将 MCP 请求的取消信号安全地传递到当前异步调用链中的 HTTP 请求。 */
     withAbortSignal<T>(signal: AbortSignal | undefined, operation: () => Promise<T>): Promise<T>;
     /**
@@ -227,6 +228,13 @@ export declare class ZentaoClient {
      * @returns 任务列表
      */
     getTasks(executionID: number, limit?: number): Promise<Task[]>;
+    /**
+     * 禅道 21.7.x 在 Token 会话下可能把执行任务路由重定向到“添加执行”页。
+     * 此时使用同版本官方 tasks 搜索接口分页读取，再按 execution ID 过滤。
+     */
+    private getTasksBySearch;
+    private extractTaskList;
+    private getTaskExecutionID;
     /**
      * 获取当前用户的任务列表，兼容禅道 21.x my-work 页面 JSON 接口。
      * @param browseType - assignedTo-指派给我，finishedBy-由我完成，closedBy-由我关闭

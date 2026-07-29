@@ -58,22 +58,12 @@ export function resolveConfigPath(
   return path.resolve(configuredPath);
 }
 
-/**
- * 从用户目录的本地 JSON 文件加载禅道连接配置。
- * 配置文件可以复用 zentao-weekly 的 zentao.baseUrl/account/password 结构。
- */
+/** 从用户指定或默认的本地 JSON 文件加载禅道连接配置。 */
 export function loadZentaoConfig(
   env: NodeJS.ProcessEnv = process.env,
   homeDir: string = os.homedir(),
 ): ZentaoConfig {
-  let configPath = resolveConfigPath(env, homeDir);
-  if (
-    !env.ZENTAO_CONFIG_PATH?.trim()
-    && !fs.existsSync(configPath)
-  ) {
-    const weeklyConfigPath = path.join(homeDir, '.zentao-weekly', 'config.json');
-    if (fs.existsSync(weeklyConfigPath)) configPath = weeklyConfigPath;
-  }
+  const configPath = resolveConfigPath(env, homeDir);
   let raw: string;
 
   try {

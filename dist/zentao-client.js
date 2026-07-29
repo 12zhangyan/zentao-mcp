@@ -141,6 +141,9 @@ export class ZentaoClient {
     isNotFound(error) {
         return axios.isAxiosError(error) && error.response?.status === 404;
     }
+    isForbidden(error) {
+        return axios.isAxiosError(error) && error.response?.status === 403;
+    }
     /** 将 MCP 请求的取消信号安全地传递到当前异步调用链中的 HTTP 请求。 */
     async withAbortSignal(signal, operation) {
         if (!signal)
@@ -779,6 +782,9 @@ export class ZentaoClient {
         catch (error) {
             if (this.isNotFound(error))
                 return null;
+            if (this.isForbidden(error)) {
+                throw new Error(`项目 #${projectID} 无权查看（禅道返回 HTTP 403）`);
+            }
             throw error;
         }
     }
@@ -849,8 +855,89 @@ export class ZentaoClient {
      */
     async getTasks(executionID, limit = 100) {
         await this.ensureLogin();
-        const response = await this.http.get(`/api.php/v1/executions/${executionID}/tasks?limit=${limit}`);
-        return response.data.data || response.data.tasks || [];
+        try {
+            const response = await this.http.get(`/api.php/v1/executions/${executionID}/tasks?limit=${limit}`);
+            const tasks = this.extractTaskList(response.data);
+            if (tasks
+                && tasks.every((task) => {
+                    const taskExecutionID = this.getTaskExecutionID(task);
+                    return taskExecutionID === 0 || taskExecutionID === executionID;
+                })) {
+                return tasks.slice(0, limit);
+            }
+        }
+        catch (error) {
+            const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+            if (status !== 400 && status !== 403 && status !== 404)
+                throw error;
+        }
+        return this.getTasksBySearch(executionID, limit);
+    }
+    /**
+     * 禅道 21.7.x 在 Token 会话下可能把执行任务路由重定向到“添加执行”页。
+     * 此时使用同版本官方 tasks 搜索接口分页读取，再按 execution ID 过滤。
+     */
+    async getTasksBySearch(executionID, limit) {
+        const configuredPageSize = this.config.maxPageSize ?? 100;
+        const pageSize = Math.min(configuredPageSize, Math.max(Math.min(100, configuredPageSize), limit * 20));
+        const maxPages = 20;
+        const matches = [];
+        let total = Number.POSITIVE_INFINITY;
+        let scannedAll = false;
+        for (let page = 1; page <= maxPages && matches.length < limit; page += 1) {
+            const response = await this.http.get(`/api.php/v1/tasks?search=1&limit=${pageSize}&page=${page}&order=id_desc`);
+            const tasks = this.extractTaskList(response.data);
+            if (!tasks) {
+                throw new Error(`执行 #${executionID} 的任务搜索接口返回了非任务列表`);
+            }
+            const responseTotal = Number(response.data.total);
+            if (Number.isFinite(responseTotal) && responseTotal >= 0)
+                total = responseTotal;
+            for (const task of tasks) {
+                if (this.getTaskExecutionID(task) === executionID)
+                    matches.push(task);
+                if (matches.length >= limit)
+                    break;
+            }
+            const scanned = page * pageSize;
+            if (tasks.length < pageSize || scanned >= total) {
+                scannedAll = true;
+                break;
+            }
+        }
+        if (!scannedAll && matches.length === 0) {
+            throw new Error(`执行 #${executionID} 的嵌套任务接口不可用，且只读任务搜索在扫描上限内未找到任务`);
+        }
+        return matches.slice(0, limit);
+    }
+    extractTaskList(payload) {
+        let candidate = payload;
+        if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+            const object = candidate;
+            if ('tasks' in object) {
+                candidate = object.tasks;
+            }
+            else if ('data' in object
+                && object.data
+                && typeof object.data === 'object') {
+                return this.extractTaskList(object.data);
+            }
+        }
+        if (!Array.isArray(candidate))
+            return null;
+        if (!candidate.every((task) => (task
+            && typeof task === 'object'
+            && Number.isFinite(Number(task.id))
+            && typeof task.name === 'string'))) {
+            return null;
+        }
+        return candidate;
+    }
+    getTaskExecutionID(task) {
+        const execution = task.execution;
+        return Number(execution && typeof execution === 'object'
+            ? execution.id ?? 0
+            : execution ?? 0);
     }
     /**
      * 获取当前用户的任务列表，兼容禅道 21.x my-work 页面 JSON 接口。
@@ -1558,7 +1645,23 @@ export class ZentaoClient {
             });
             this.handleLegacyCookies(loginPageResp);
             const loginPage = this.unwrapLegacyPayload(loginPageResp.data);
-            const verifyRand = String(loginPage.rand ?? '');
+            let verifyRand = String(loginPage.rand ?? '');
+            try {
+                const refreshRandResp = await this.http.get('/user-refreshRandom.json', {
+                    headers: {
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Cookie': this.legacyCookies.join('; '),
+                    },
+                });
+                this.handleLegacyCookies(refreshRandResp);
+                const refreshedRand = String(refreshRandResp.data ?? '').trim();
+                if (/^\d+$/.test(refreshedRand))
+                    verifyRand = refreshedRand;
+            }
+            catch (error) {
+                if (!this.isNotFound(error))
+                    throw error;
+            }
             const password = verifyRand
                 ? this.md5(`${this.md5(this.config.password)}${verifyRand}`)
                 : this.config.password;
@@ -1580,10 +1683,23 @@ export class ZentaoClient {
             const loginData = (typeof loginResp.data === 'string'
                 ? JSON.parse(loginResp.data)
                 : loginResp.data);
-            const loginSucceeded = (loginData.result === 'success'
-                || loginData.status === 'success'
-                || Boolean(loginData.user)
-                || Boolean(loginData.userID));
+            let nestedLoginData = loginData.data;
+            if (typeof nestedLoginData === 'string') {
+                try {
+                    nestedLoginData = JSON.parse(nestedLoginData);
+                }
+                catch {
+                    nestedLoginData = undefined;
+                }
+            }
+            const returnedLoginPage = Boolean(nestedLoginData
+                && typeof nestedLoginData === 'object'
+                && 'rand' in nestedLoginData);
+            const loginSucceeded = (!returnedLoginPage
+                && (loginData.result === 'success'
+                    || loginData.status === 'success'
+                    || Boolean(loginData.user)
+                    || Boolean(loginData.userID)));
             if (!loginSucceeded) {
                 const status = typeof loginData.status === 'string' ? loginData.status : 'missing';
                 const result = typeof loginData.result === 'string' ? loginData.result : 'missing';
@@ -1647,22 +1763,29 @@ export class ZentaoClient {
     /** 解包禅道 Web JSON 常见的 data 字符串/对象包装。 */
     unwrapLegacyPayload(payload) {
         if (typeof payload === 'string') {
+            let parsed;
             try {
-                return this.unwrapLegacyPayload(JSON.parse(payload));
+                parsed = JSON.parse(payload);
             }
             catch {
-                return payload;
+                throw new Error('内置 API 返回了非 JSON 响应（可能是登录失效、权限不足或接口路由不兼容）');
             }
+            return this.unwrapLegacyPayload(parsed);
         }
-        if (payload && typeof payload === 'object' && 'data' in payload) {
-            const data = payload.data;
+        if (payload && typeof payload === 'object') {
+            const object = payload;
+            if (object.result === false || object.result === 'fail' || object.status === 'fail') {
+                const message = typeof object.message === 'string'
+                    ? object.message
+                    : '请求失败';
+                const suffix = object.load === 'login' ? '（会话已失效）' : '';
+                throw new Error(`内置 API ${message}${suffix}`);
+            }
+            if (!('data' in object))
+                return payload;
+            const data = object.data;
             if (typeof data === 'string') {
-                try {
-                    return JSON.parse(data);
-                }
-                catch {
-                    throw new Error('内置 API 返回了无效 JSON');
-                }
+                return this.unwrapLegacyPayload(data);
             }
             if (data && typeof data === 'object')
                 return data;
@@ -1720,8 +1843,28 @@ export class ZentaoClient {
      * @returns 文档空间数据
      */
     async getDocSpaceData(type, spaceID) {
-        const data = await this.legacyGet(`/index.php?m=doc&f=ajaxGetSpaceData&type=${type}&spaceID=${spaceID}&picks=`);
-        return data;
+        await this.ensureLogin();
+        const libsResponse = await this.http.get(`/api.php/v1/doclibs?type=${type}&objectID=${spaceID}`);
+        if (!Array.isArray(libsResponse.data.libs)) {
+            throw new Error(`${type === 'product' ? '产品' : '项目'} #${spaceID} 的文档库接口返回了非结构化数据`);
+        }
+        const libs = libsResponse.data.libs.map((lib) => ({
+            ...lib,
+            type,
+            [type]: spaceID,
+        }));
+        const trees = await Promise.all(libs.map(async (lib) => {
+            const response = await this.http.get(`/api.php/v1/doclibs/${lib.id}`);
+            if (!Array.isArray(response.data.docs)) {
+                throw new Error(`文档库 #${lib.id} 返回了非结构化文档树`);
+            }
+            return response.data.docs;
+        }));
+        return {
+            spaceID,
+            libs,
+            docs: trees.flat(),
+        };
     }
     /**
      * 获取文档详情
@@ -1730,9 +1873,23 @@ export class ZentaoClient {
      * @returns 文档详情
      */
     async getDoc(docID, version = 0) {
+        if (version !== 0) {
+            return this.legacyGet(`/doc-ajaxGetDoc-${docID}-${version}.html`);
+        }
+        await this.ensureLogin();
         try {
-            const data = await this.legacyGet(`/index.php?m=doc&f=ajaxGetDoc&docID=${docID}&version=${version}`);
-            return data || null;
+            const response = await this.http.get(`/api.php/v1/docs/${docID}`);
+            const payload = response.data;
+            const data = payload !== null && typeof payload === 'object' && 'data' in payload
+                ? payload.data
+                : payload;
+            if (!data
+                || typeof data !== 'object'
+                || !Number.isFinite(Number(data.id))
+                || typeof data.title !== 'string') {
+                throw new Error(`文档 #${docID} 接口返回了非结构化详情`);
+            }
+            return data;
         }
         catch (error) {
             if (this.isNotFound(error))

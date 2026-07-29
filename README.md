@@ -49,7 +49,7 @@ npm run verify
 - Windows：`%USERPROFILE%\.zentao-mcp\config.json`
 - macOS/Linux：`~/.zentao-mcp/config.json`
 
-也可复用已有的 `~/.zentao-weekly/config.json`。如果需要指定其他本地文件，只在 MCP 进程中设置 `ZENTAO_CONFIG_PATH`，不要设置账号、密码或 Token 环境变量。
+如果需要指定其他本地文件，只在 MCP 进程中设置 `ZENTAO_CONFIG_PATH`。账号、密码和 Token 不得写入代码、日志或仓库文件。
 
 配置示例（只使用脱敏占位符）：
 

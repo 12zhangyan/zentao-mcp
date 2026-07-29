@@ -1026,6 +1026,8 @@ export interface DocModule {
 }
 /** 鏂囨。绌洪棿鏁版嵁锛堝寘鍚枃妗ｅ簱鍜岀洰褰曟爲锛?*/
 export interface DocSpaceData {
+    /** 空间 ID（产品或项目 ID） */
+    spaceID?: number;
     /** 鏂囨。搴撳垪琛?*/
     libs?: DocLib[];
     /** 鐩綍鍒楄〃 */
