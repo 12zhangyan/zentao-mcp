@@ -23,6 +23,19 @@
 
 ## 安装和配置
 
+从 npm 安装：
+
+```bash
+npm install -g @yanzhang123/zentao-mcp
+zentao-mcp-setup
+```
+
+也可以不全局安装：
+
+```bash
+npx -y --package @yanzhang123/zentao-mcp zentao-mcp-setup
+```
+
 从源码部署：
 
 ```bash
@@ -65,6 +78,24 @@ npm run verify
 - `timeoutMs`：1000–120000；`maxRetries`：0–5；`maxPageSize`：1–500；`maxResponseChars`：10000–1000000。
 
 ## MCP 客户端配置
+
+npm 方式：
+
+```json
+{
+  "mcpServers": {
+    "zentao": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "--package",
+        "@yanzhang123/zentao-mcp",
+        "zentao-mcp"
+      ]
+    }
+  }
+}
+```
 
 本地源码方式：
 
@@ -139,12 +170,15 @@ npm run verify
 
 ## 发布检查
 
-发布前至少执行：
+发布新版本前先更新版本号，并在 PR 中提交 `package.json` 与 `package-lock.json`：
 
 ```bash
+npm version patch
 npm ci
 npm run verify
 ```
+
+PR 合并到 `main` 后，GitHub Actions 会使用 npm Trusted Publishing 自动发布。已存在的版本会安全跳过，不使用或保存长期 npm Token。
 
 真实配置文件、`.env`、响应转储、日志和任何凭据都不得进入发布包或版本控制。
 
