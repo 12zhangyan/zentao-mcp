@@ -11,6 +11,16 @@ export interface ZentaoConfig {
     password: string;
     /** 鏄惁璺宠繃SSL璇佷功楠岃瘉锛堣嚜绛惧悕璇佷功鏃惰涓簍rue锛?*/
     rejectUnauthorized?: boolean;
+    /** 单次 HTTP 请求超时（毫秒） */
+    timeoutMs?: number;
+    /** 幂等 GET 请求的瞬时故障重试次数 */
+    maxRetries?: number;
+    /** 单次列表查询允许的最大条数 */
+    maxPageSize?: number;
+    /** 单次 MCP 文本响应允许的最大字符数 */
+    maxResponseChars?: number;
+    /** 是否允许创建、编辑、关闭等写操作，默认 false */
+    allowWrites?: boolean;
 }
 /** Bug 鐘舵€佹灇涓?*/
 export type BugStatus = 'active' | 'resolved' | 'closed';

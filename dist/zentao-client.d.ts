@@ -10,28 +10,34 @@ import { ZentaoConfig, Bug, Story, Product, Project, CreateBugParams, ResolveBug
 export declare class ZentaoClient {
     private config;
     private http;
-    private sessionID;
     private isLoggedIn;
+    private loginPromise?;
+    private token;
+    private readonly logger;
+    private readonly requestSignals;
     private legacySessionID;
-    private legacySessionName;
-    private legacyRand;
     private isLegacyLoggedIn;
+    private legacyLoginPromise?;
     private legacyCookies;
     /**
      * 创建禅道客户端实例
      * @param config - 禅道配置
      */
     constructor(config: ZentaoConfig);
-    /**
-     * 获取 Session ID
-     * @returns Session ID
-     */
-    private getSessionID;
+    private recoverRequest;
+    private shouldRetry;
+    private retryDelayMs;
+    /** 记录不包含连接凭据的请求错误。 */
+    private logRequestError;
+    private isNotFound;
+    /** 将 MCP 请求的取消信号安全地传递到当前异步调用链中的 HTTP 请求。 */
+    withAbortSignal<T>(signal: AbortSignal | undefined, operation: () => Promise<T>): Promise<T>;
     /**
      * 登录禅道系统
      * @returns 是否登录成功
      */
     login(): Promise<boolean>;
+    private performLogin;
     /**
      * 确保已登录
      */
@@ -222,6 +228,13 @@ export declare class ZentaoClient {
      */
     getTasks(executionID: number, limit?: number): Promise<Task[]>;
     /**
+     * 获取当前用户的任务列表，兼容禅道 21.x my-work 页面 JSON 接口。
+     * @param browseType - assignedTo-指派给我，finishedBy-由我完成，closedBy-由我关闭
+     * @param limit - 返回数量限制
+     */
+    getMyTasks(browseType?: 'assignedTo' | 'finishedBy' | 'closedBy', limit?: number): Promise<Task[]>;
+    private normalizeLegacyTasks;
+    /**
      * 获取任务详情
      * @param taskID - 任务 ID
      * @returns 任务详情
@@ -407,22 +420,25 @@ export declare class ZentaoClient {
     updateExecution(params: UpdateExecutionParams): Promise<Execution | null>;
     /**
      * 确保内置 API 已登录
-     * 内置 API 使用不同的认证方式：
-     * 1. 获取 sessionID 和 rand: GET /index.php?m=api&f=getSessionID&t=json
-     * 2. 用户登录: POST /index.php?m=user&f=login&t=json&zentaosid=xxx
-     *    密码加密: md5(md5(password) + rand)
+     * 禅道 21.x Web JSON 使用表单登录并通过 Cookie 维持会话。
      */
     private ensureLegacyLogin;
+    private performLegacyLogin;
+    private md5;
     /**
      * 处理内置 API 响应中的 cookies
      */
     private handleLegacyCookies;
+    private storeLegacyCookies;
     /**
      * 内置 API GET 请求
      * @param path - 请求路径
      * @returns 响应数据
      */
     private legacyGet;
+    /** 解包禅道 Web JSON 常见的 data 字符串/对象包装。 */
+    private unwrapLegacyPayload;
+    private withLegacySession;
     /**
      * 内置 API POST 请求 (JSON 格式)
      * @param path - 请求路径

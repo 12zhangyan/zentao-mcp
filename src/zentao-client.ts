@@ -3,10 +3,18 @@
  * 封装禅道 REST API 的调用，支持 Bug 和需求的增删改查
  */
 
-import axios, { AxiosInstance, AxiosResponse } from 'axios';
+import axios, {
+  AxiosError,
+  AxiosInstance,
+  AxiosResponse,
+  InternalAxiosRequestConfig,
+} from 'axios';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash } from 'node:crypto';
 import https from 'https';
-import CryptoJS from 'crypto-js';
 import FormData from 'form-data';
+import { SafeLogger } from './logger.js';
+import { redactSensitiveText } from './redaction.js';
 import {
   ZentaoConfig,
   Bug,
@@ -59,6 +67,20 @@ import {
   EditDocModuleParams,
 } from './types.js';
 
+interface RetryableRequestConfig extends InternalAxiosRequestConfig {
+  __zentaoAuthRetried?: boolean;
+  __zentaoTransientRetries?: number;
+}
+
+interface LegacyTaskPage {
+  tasks?: Task[] | Record<string, Task>;
+  pager?: {
+    recTotal?: number | string;
+    recPerPage?: number | string;
+    pageTotal?: number | string;
+  };
+}
+
 /**
  * 禅道 API 客户端类
  * 提供与禅道系统交互的所有方法
@@ -66,14 +88,16 @@ import {
 export class ZentaoClient {
   private config: ZentaoConfig;
   private http: AxiosInstance;
-  private sessionID: string = '';
   private isLoggedIn: boolean = false;
+  private loginPromise?: Promise<boolean>;
+  private token: string = '';
+  private readonly logger: SafeLogger;
+  private readonly requestSignals = new AsyncLocalStorage<AbortSignal>();
   
   // 内置 API 认证相关属性
   private legacySessionID: string = '';
-  private legacySessionName: string = 'zentaosid';
-  private legacyRand: number = 0;
   private isLegacyLoggedIn: boolean = false;
+  private legacyLoginPromise?: Promise<void>;
   private legacyCookies: string[] = [];
 
   /**
@@ -82,16 +106,33 @@ export class ZentaoClient {
    */
   constructor(config: ZentaoConfig) {
     this.config = config;
+    this.logger = new SafeLogger([config.url, config.account, config.password]);
 
     // 规范化 URL
     const baseURL = config.url.endsWith('/') ? config.url.slice(0, -1) : config.url;
+    const baseOrigin = new URL(baseURL).origin;
 
     // 创建 axios 实例配置
     const axiosConfig: Parameters<typeof axios.create>[0] = {
       baseURL,
-      timeout: 30000,
+      timeout: config.timeoutMs ?? 30000,
+      maxRedirects: 3,
+      beforeRedirect: (options, responseDetails) => {
+        const target = new URL(String(options.href));
+        if (target.origin !== baseOrigin) {
+          throw new Error('拒绝跨源 HTTP 重定向');
+        }
+        this.storeLegacyCookies(responseDetails.headers['set-cookie']);
+        if (this.legacyCookies.length > 0) {
+          options.headers.Cookie = this.legacyCookies.join('; ');
+        }
+      },
+      maxContentLength: 10 * 1024 * 1024,
+      maxBodyLength: 10 * 1024 * 1024,
+      proxy: false,
       headers: {
         'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (compatible; zentao-mcp/1.1.0)',
       },
     };
 
@@ -103,15 +144,98 @@ export class ZentaoClient {
     }
 
     this.http = axios.create(axiosConfig);
+    this.http.interceptors.request.use((requestConfig) => {
+      const signal = this.requestSignals.getStore();
+      if (signal && !requestConfig.signal) requestConfig.signal = signal;
+      return requestConfig;
+    });
+    this.http.interceptors.response.use(
+      (response) => response,
+      async (error: AxiosError) => this.recoverRequest(error),
+    );
   }
 
-  /**
-   * 获取 Session ID
-   * @returns Session ID
-   */
-  private async getSessionID(): Promise<string> {
-    const response = await this.http.get('/api.php/v1/tokens');
-    return response.data.data || response.data.sessionID || response.data;
+  private async recoverRequest(error: AxiosError): Promise<AxiosResponse> {
+    const requestConfig = error.config as RetryableRequestConfig | undefined;
+    if (!requestConfig) throw error;
+
+    const status = error.response?.status;
+    const isTokenRequest = requestConfig.url?.includes('/api.php/v1/tokens') === true;
+    if (status === 401 && !isTokenRequest && !requestConfig.__zentaoAuthRetried) {
+      requestConfig.__zentaoAuthRetried = true;
+      this.isLoggedIn = false;
+      this.token = '';
+      delete this.http.defaults.headers.common['Token'];
+      await this.login();
+      requestConfig.headers.set('Token', this.token);
+      this.logger.log('info', 'auth_token_refreshed');
+      return this.http.request(requestConfig);
+    }
+
+    const retryCount = requestConfig.__zentaoTransientRetries ?? 0;
+    if (this.shouldRetry(error, requestConfig) && retryCount < (this.config.maxRetries ?? 2)) {
+      const nextRetry = retryCount + 1;
+      requestConfig.__zentaoTransientRetries = nextRetry;
+      const delayMs = this.retryDelayMs(error, nextRetry);
+      this.logger.log('warn', 'http_request_retry', {
+        attempt: nextRetry,
+        status: status ?? null,
+        code: error.code ?? null,
+        delayMs,
+      });
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      return this.http.request(requestConfig);
+    }
+
+    throw error;
+  }
+
+  private shouldRetry(error: AxiosError, config: RetryableRequestConfig): boolean {
+    if (config.method?.toUpperCase() !== 'GET') return false;
+    if (error.code === 'ERR_CANCELED') return false;
+    const status = error.response?.status;
+    if (status === 429 || status === 502 || status === 503 || status === 504) return true;
+    return !error.response && [
+      'ECONNABORTED',
+      'ECONNRESET',
+      'ETIMEDOUT',
+      'EAI_AGAIN',
+    ].includes(error.code ?? '');
+  }
+
+  private retryDelayMs(error: AxiosError, attempt: number): number {
+    const retryAfter = error.response?.headers?.['retry-after'];
+    if (typeof retryAfter === 'string' && /^\d+$/.test(retryAfter)) {
+      return Math.min(Number(retryAfter) * 1000, 10_000);
+    }
+    return Math.min(250 * (2 ** (attempt - 1)), 2_000);
+  }
+
+  /** 记录不包含连接凭据的请求错误。 */
+  private logRequestError(context: string, error: unknown): void {
+    const message = redactSensitiveText(
+      error instanceof Error ? error.message : '未知错误',
+      [
+        this.config.url,
+        this.config.account,
+        this.config.password,
+        this.token,
+      ],
+    );
+    this.logger.log('error', 'zentao_request_failed', { context, message });
+  }
+
+  private isNotFound(error: unknown): boolean {
+    return axios.isAxiosError(error) && error.response?.status === 404;
+  }
+
+  /** 将 MCP 请求的取消信号安全地传递到当前异步调用链中的 HTTP 请求。 */
+  async withAbortSignal<T>(
+    signal: AbortSignal | undefined,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    if (!signal) return operation();
+    return this.requestSignals.run(signal, operation);
   }
 
   /**
@@ -119,40 +243,41 @@ export class ZentaoClient {
    * @returns 是否登录成功
    */
   async login(): Promise<boolean> {
-    if (this.isLoggedIn) {
-      return true;
-    }
-
+    if (this.isLoggedIn) return true;
+    if (this.loginPromise) return this.loginPromise;
+    this.loginPromise = this.performLogin();
     try {
-      // 获取 session
-      this.sessionID = await this.getSessionID();
+      return await this.loginPromise;
+    } finally {
+      this.loginPromise = undefined;
+    }
+  }
 
-      // 密码 MD5 加密
-      const passwordMd5 = CryptoJS.MD5(this.config.password).toString();
-
-      // 登录请求
-      const response = await this.http.post(`/api.php/v1/tokens`, {
+  private async performLogin(): Promise<boolean> {
+    try {
+      // REST API v1 直接使用账号和原始密码换取 Token。
+      // 旧实现先 GET session 再提交 MD5 密码，与禅道 21.x 的 Token 契约不兼容。
+      const response = await this.http.post('/api.php/v1/tokens', {
         account: this.config.account,
-        password: passwordMd5,
+        password: this.config.password,
       });
 
-      if (response.data.token) {
-        // 新版本 API 返回 token
-        this.http.defaults.headers.common['Token'] = response.data.token;
-        this.isLoggedIn = true;
-      } else if (response.data.data?.token) {
-        this.http.defaults.headers.common['Token'] = response.data.data.token;
-        this.isLoggedIn = true;
-      } else {
-        // 老版本可能使用 session
-        this.http.defaults.headers.common['Cookie'] = `zentaosid=${this.sessionID}`;
-        this.isLoggedIn = true;
+      const token = response.data?.token || response.data?.data?.token;
+      if (typeof token !== 'string' || !token) {
+        throw new Error('Token 接口未返回有效 token');
       }
 
+      this.token = token;
+      this.http.defaults.headers.common['Token'] = this.token;
+      this.isLoggedIn = true;
       return true;
     } catch (error) {
-      console.error('禅道登录失败:', error);
-      throw new Error(`禅道登录失败: ${error instanceof Error ? error.message : '未知错误'}`);
+      const message = redactSensitiveText(
+        error instanceof Error ? error.message : '未知错误',
+        [this.config.url, this.config.account, this.config.password],
+      );
+      this.logger.log('error', 'zentao_login_failed', { message });
+      throw new Error(`禅道登录失败: ${message}`);
     }
   }
 
@@ -215,8 +340,9 @@ export class ZentaoClient {
         `/api.php/v1/bugs/${bugID}`
       );
       return response.data.data || (response.data as unknown as Bug);
-    } catch {
-      return null;
+    } catch (error) {
+      if (this.isNotFound(error)) return null;
+      throw error;
     }
   }
 
@@ -274,8 +400,8 @@ export class ZentaoClient {
       });
       return true;
     } catch (error) {
-      console.error('解决 Bug 失败:', error);
-      return false;
+      this.logRequestError('解决 Bug 失败', error);
+      throw error;
     }
   }
 
@@ -293,8 +419,8 @@ export class ZentaoClient {
       });
       return true;
     } catch (error) {
-      console.error('关闭 Bug 失败:', error);
-      return false;
+      this.logRequestError('关闭 Bug 失败', error);
+      throw error;
     }
   }
 
@@ -313,8 +439,8 @@ export class ZentaoClient {
       });
       return true;
     } catch (error) {
-      console.error('激活 Bug 失败:', error);
-      return false;
+      this.logRequestError('激活 Bug 失败', error);
+      throw error;
     }
   }
 
@@ -333,8 +459,8 @@ export class ZentaoClient {
       });
       return true;
     } catch (error) {
-      console.error('确认 Bug 失败:', error);
-      return false;
+      this.logRequestError('确认 Bug 失败', error);
+      throw error;
     }
   }
 
@@ -373,8 +499,9 @@ export class ZentaoClient {
         `/api.php/v1/stories/${storyID}`
       );
       return response.data.data || (response.data as unknown as Story);
-    } catch {
-      return null;
+    } catch (error) {
+      if (this.isNotFound(error)) return null;
+      throw error;
     }
   }
 
@@ -418,9 +545,12 @@ export class ZentaoClient {
       // 返回完整响应作为调试信息
       return response.data as unknown as Story;
     } catch (error: unknown) {
-      const axiosError = error as { response?: { data?: unknown }; message?: string };
-      console.error('创建需求失败:', axiosError.response?.data || axiosError.message);
-      throw new Error(`创建需求失败: ${JSON.stringify(axiosError.response?.data || axiosError.message)}`);
+      this.logRequestError('创建需求失败', error);
+      const message = redactSensitiveText(
+        error instanceof Error ? error.message : '未知错误',
+        [this.config.url, this.config.account, this.config.password],
+      );
+      throw new Error(`创建需求失败: ${message}`);
     }
   }
 
@@ -439,8 +569,8 @@ export class ZentaoClient {
       });
       return true;
     } catch (error) {
-      console.error('关闭需求失败:', error);
-      return false;
+      this.logRequestError('关闭需求失败', error);
+      throw error;
     }
   }
 
@@ -461,8 +591,8 @@ export class ZentaoClient {
       });
       return true;
     } catch (error) {
-      console.error('激活需求失败:', error);
-      return false;
+      this.logRequestError('激活需求失败', error);
+      throw error;
     }
   }
 
@@ -541,8 +671,9 @@ export class ZentaoClient {
         `/api.php/v1/testcases/${caseID}`
       );
       return response.data;
-    } catch {
-      return null;
+    } catch (error) {
+      if (this.isNotFound(error)) return null;
+      throw error;
     }
   }
 
@@ -605,8 +736,9 @@ export class ZentaoClient {
         updateData
       );
       return response.data.data || (response.data as unknown as Bug);
-    } catch {
-      return null;
+    } catch (error) {
+      if (this.isNotFound(error)) return null;
+      throw error;
     }
   }
 
@@ -635,8 +767,9 @@ export class ZentaoClient {
         updateData
       );
       return response.data.data || (response.data as unknown as Story);
-    } catch {
-      return null;
+    } catch (error) {
+      if (this.isNotFound(error)) return null;
+      throw error;
     }
   }
 
@@ -659,8 +792,9 @@ export class ZentaoClient {
         updateData
       );
       return response.data.data || (response.data as unknown as Story);
-    } catch {
-      return null;
+    } catch (error) {
+      if (this.isNotFound(error)) return null;
+      throw error;
     }
   }
 
@@ -679,8 +813,9 @@ export class ZentaoClient {
         `/api.php/v1/products/${productID}`
       );
       return response.data.data || (response.data as unknown as Product);
-    } catch {
-      return null;
+    } catch (error) {
+      if (this.isNotFound(error)) return null;
+      throw error;
     }
   }
 
@@ -741,8 +876,9 @@ export class ZentaoClient {
         updateData
       );
       return response.data.data || (response.data as unknown as Product);
-    } catch {
-      return null;
+    } catch (error) {
+      if (this.isNotFound(error)) return null;
+      throw error;
     }
   }
 
@@ -761,8 +897,9 @@ export class ZentaoClient {
         `/api.php/v1/projects/${projectID}`
       );
       return response.data.data || (response.data as unknown as Project);
-    } catch {
-      return null;
+    } catch (error) {
+      if (this.isNotFound(error)) return null;
+      throw error;
     }
   }
 
@@ -816,8 +953,9 @@ export class ZentaoClient {
         updateData
       );
       return response.data.data || (response.data as unknown as Project);
-    } catch {
-      return null;
+    } catch (error) {
+      if (this.isNotFound(error)) return null;
+      throw error;
     }
   }
 
@@ -839,6 +977,48 @@ export class ZentaoClient {
   }
 
   /**
+   * 获取当前用户的任务列表，兼容禅道 21.x my-work 页面 JSON 接口。
+   * @param browseType - assignedTo-指派给我，finishedBy-由我完成，closedBy-由我关闭
+   * @param limit - 返回数量限制
+   */
+  async getMyTasks(
+    browseType: 'assignedTo' | 'finishedBy' | 'closedBy' = 'assignedTo',
+    limit: number = 100,
+  ): Promise<Task[]> {
+    const first = await this.legacyGet<LegacyTaskPage>(
+      `/my-work-task-${browseType}.json`,
+    );
+    const tasks = this.normalizeLegacyTasks(first.tasks);
+    if (tasks.length >= limit) return tasks.slice(0, limit);
+
+    const recTotal = Number(first.pager?.recTotal ?? tasks.length);
+    const recPerPage = Number(first.pager?.recPerPage ?? (tasks.length || 20));
+    const pageTotal = Math.max(1, Number(first.pager?.pageTotal ?? 1));
+
+    for (let pageID = 2; pageID <= pageTotal && tasks.length < limit; pageID += 1) {
+      const page = await this.legacyGet<LegacyTaskPage>(
+        `/my-work-task-${browseType}--id_desc-${recTotal}-${recPerPage}-${pageID}.json`,
+      );
+      const pageTasks = this.normalizeLegacyTasks(page.tasks);
+      if (pageTasks.length === 0) break;
+      tasks.push(...pageTasks);
+    }
+    return tasks.slice(0, limit);
+  }
+
+  private normalizeLegacyTasks(value: LegacyTaskPage['tasks']): Task[] {
+    if (Array.isArray(value)) return value;
+    if (!value || typeof value !== 'object') return [];
+    return Object.entries(value)
+      .filter(([, task]) => task && typeof task === 'object')
+      .map(([key, task]) => (
+        task.id === undefined && /^\d+$/.test(key)
+          ? { ...task, id: Number(key) }
+          : task
+      ));
+  }
+
+  /**
    * 获取任务详情
    * @param taskID - 任务 ID
    * @returns 任务详情
@@ -851,8 +1031,9 @@ export class ZentaoClient {
         `/api.php/v1/tasks/${taskID}`
       );
       return response.data.data || (response.data as unknown as Task);
-    } catch {
-      return null;
+    } catch (error) {
+      if (this.isNotFound(error)) return null;
+      throw error;
     }
   }
 
@@ -912,8 +1093,9 @@ export class ZentaoClient {
         updateData
       );
       return response.data.data || (response.data as unknown as Task);
-    } catch {
-      return null;
+    } catch (error) {
+      if (this.isNotFound(error)) return null;
+      throw error;
     }
   }
 
@@ -946,8 +1128,9 @@ export class ZentaoClient {
         `/api.php/v1/users/${userID}`
       );
       return response.data.data || (response.data as unknown as User);
-    } catch {
-      return null;
+    } catch (error) {
+      if (this.isNotFound(error)) return null;
+      throw error;
     }
   }
 
@@ -963,8 +1146,9 @@ export class ZentaoClient {
         '/api.php/v1/user'
       );
       return response.data.data?.profile || (response.data as unknown as { profile: User }).profile || null;
-    } catch {
-      return null;
+    } catch (error) {
+      if (this.isNotFound(error)) return null;
+      throw error;
     }
   }
 
@@ -1224,7 +1408,7 @@ export class ZentaoClient {
       await this.http.post(`/api.php/v1/productplans/${planID}/linkstories`, { stories });
       return true;
     } catch (error) {
-      console.error('计划关联需求失败:', error);
+      this.logRequestError('计划关联需求失败', error);
       return false;
     }
   }
@@ -1242,7 +1426,7 @@ export class ZentaoClient {
       await this.http.post(`/api.php/v1/productplans/${planID}/unlinkstories`, { stories });
       return true;
     } catch (error) {
-      console.error('计划取消关联需求失败:', error);
+      this.logRequestError('计划取消关联需求失败', error);
       return false;
     }
   }
@@ -1260,7 +1444,7 @@ export class ZentaoClient {
       await this.http.post(`/api.php/v1/productplans/${planID}/linkbugs`, { bugs });
       return true;
     } catch (error) {
-      console.error('计划关联 Bug 失败:', error);
+      this.logRequestError('计划关联 Bug 失败', error);
       return false;
     }
   }
@@ -1278,7 +1462,7 @@ export class ZentaoClient {
       await this.http.post(`/api.php/v1/productplans/${planID}/unlinkbugs`, { bugs });
       return true;
     } catch (error) {
-      console.error('计划取消关联 Bug 失败:', error);
+      this.logRequestError('计划取消关联 Bug 失败', error);
       return false;
     }
   }
@@ -1506,71 +1690,112 @@ export class ZentaoClient {
 
   /**
    * 确保内置 API 已登录
-   * 内置 API 使用不同的认证方式：
-   * 1. 获取 sessionID 和 rand: GET /index.php?m=api&f=getSessionID&t=json
-   * 2. 用户登录: POST /index.php?m=user&f=login&t=json&zentaosid=xxx
-   *    密码加密: md5(md5(password) + rand)
+   * 禅道 21.x Web JSON 使用表单登录并通过 Cookie 维持会话。
    */
   private async ensureLegacyLogin(): Promise<void> {
-    if (this.isLegacyLoggedIn) {
-      return;
-    }
-
+    if (this.isLegacyLoggedIn) return;
+    if (this.legacyLoginPromise) return this.legacyLoginPromise;
+    this.legacyLoginPromise = this.performLegacyLogin();
     try {
-      // 1. 获取 sessionID 和 rand
-      const sessionResp = await this.http.get('/index.php?m=api&f=getSessionID&t=json');
-      this.handleLegacyCookies(sessionResp);
+      await this.legacyLoginPromise;
+    } finally {
+      this.legacyLoginPromise = undefined;
+    }
+  }
 
-      let sessionData = sessionResp.data;
-      if (typeof sessionData.data === 'string') {
-        sessionData = JSON.parse(sessionData.data);
-      } else if (sessionData.data) {
-        sessionData = sessionData.data;
-      }
-
-      this.legacySessionID = sessionData.sessionID;
-      this.legacySessionName = sessionData.sessionName || 'zentaosid';
-      this.legacyRand = sessionData.rand || 0;
-
-      // 2. 用户登录，密码使用 md5(md5(password) + rand) 加密
-      const passwordMd5 = CryptoJS.MD5(this.config.password).toString();
-      const encryptedPassword = CryptoJS.MD5(passwordMd5 + this.legacyRand).toString();
+  private async performLegacyLogin(): Promise<void> {
+    try {
+      const loginPageResp = await this.http.get('/user-login.json', {
+        headers: { 'X-Requested-With': 'XMLHttpRequest' },
+      });
+      this.handleLegacyCookies(loginPageResp);
+      const loginPage = this.unwrapLegacyPayload<{ rand?: string | number }>(
+        loginPageResp.data,
+      );
+      const verifyRand = String(loginPage.rand ?? '');
+      const password = verifyRand
+        ? this.md5(`${this.md5(this.config.password)}${verifyRand}`)
+        : this.config.password;
 
       const loginResp = await this.http.post(
-        `/index.php?m=user&f=login&t=json&${this.legacySessionName}=${this.legacySessionID}`,
-        `account=${this.config.account}&password=${encryptedPassword}&verifyRand=${this.legacyRand}`,
+        '/user-login.json',
+        new URLSearchParams({
+          account: this.config.account,
+          password,
+          passwordStrength: '3',
+          referer: '/my/',
+          verifyRand,
+          keepLogin: '1',
+        }).toString(),
         {
           headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'X-Requested-With': 'XMLHttpRequest',
             'Cookie': this.legacyCookies.join('; '),
           },
         }
       );
       this.handleLegacyCookies(loginResp);
+      const loginData = (
+        typeof loginResp.data === 'string'
+          ? JSON.parse(loginResp.data)
+          : loginResp.data
+      ) as Record<string, unknown>;
+      const loginSucceeded = (
+        loginData.result === 'success'
+        || loginData.status === 'success'
+        || Boolean(loginData.user)
+        || Boolean(loginData.userID)
+      );
+      if (!loginSucceeded) {
+        const status = typeof loginData.status === 'string' ? loginData.status : 'missing';
+        const result = typeof loginData.result === 'string' ? loginData.result : 'missing';
+        const responseUrl = (
+          loginResp.request as { res?: { responseUrl?: string } } | undefined
+        )?.res?.responseUrl;
+        const finalPath = responseUrl ? new URL(responseUrl).pathname : 'unknown';
+        throw new Error(
+          `内置 API 拒绝登录（status=${status}, result=${result}, path=${finalPath}）`,
+        );
+      }
 
       this.isLegacyLoggedIn = true;
     } catch (error) {
-      console.error('内置 API 登录失败:', error);
-      throw new Error(`内置 API 登录失败: ${error instanceof Error ? error.message : '未知错误'}`);
+      this.logRequestError('内置 API 登录失败', error);
+      const message = redactSensitiveText(
+        error instanceof Error ? error.message : '未知错误',
+        [this.config.url, this.config.account, this.config.password],
+      );
+      throw new Error(`内置 API 登录失败: ${message}`);
     }
+  }
+
+  private md5(value: string): string {
+    return createHash('md5').update(value, 'utf8').digest('hex');
   }
 
   /**
    * 处理内置 API 响应中的 cookies
    */
   private handleLegacyCookies(response: AxiosResponse): void {
-    const setCookies = response.headers['set-cookie'];
-    if (setCookies) {
-      setCookies.forEach((c: string) => {
-        const name = c.split('=')[0];
-        const value = c.split(';')[0];
-        const idx = this.legacyCookies.findIndex((x) => x.startsWith(name + '='));
-        if (idx >= 0) {
-          this.legacyCookies[idx] = value;
-        } else {
-          this.legacyCookies.push(value);
-        }
-      });
+    this.storeLegacyCookies(response.headers['set-cookie']);
+  }
+
+  private storeLegacyCookies(header: string | string[] | undefined): void {
+    if (!header) return;
+    const setCookies = Array.isArray(header)
+      ? header
+      : header.split(/,(?=[^;,]+=)/);
+    for (const cookie of setCookies) {
+      const name = cookie.split('=')[0]?.trim();
+      const value = cookie.split(';')[0]?.trim();
+      if (!name || !value) continue;
+      const index = this.legacyCookies.findIndex((item) => item.startsWith(`${name}=`));
+      if (index >= 0) {
+        this.legacyCookies[index] = value;
+      } else {
+        this.legacyCookies.push(value);
+      }
     }
   }
 
@@ -1581,9 +1806,8 @@ export class ZentaoClient {
    */
   private async legacyGet<T = unknown>(path: string): Promise<T> {
     await this.ensureLegacyLogin();
-    const sep = path.includes('?') ? '&' : '?';
     const response = await this.http.get(
-      `${path}${sep}${this.legacySessionName}=${this.legacySessionID}`,
+      this.withLegacySession(path),
       {
         headers: {
           'X-Requested-With': 'XMLHttpRequest',
@@ -1592,7 +1816,36 @@ export class ZentaoClient {
       }
     );
     this.handleLegacyCookies(response);
-    return response.data;
+    return this.unwrapLegacyPayload<T>(response.data);
+  }
+
+  /** 解包禅道 Web JSON 常见的 data 字符串/对象包装。 */
+  private unwrapLegacyPayload<T>(payload: unknown): T {
+    if (typeof payload === 'string') {
+      try {
+        return this.unwrapLegacyPayload<T>(JSON.parse(payload));
+      } catch {
+        return payload as T;
+      }
+    }
+    if (payload && typeof payload === 'object' && 'data' in payload) {
+      const data = (payload as { data?: unknown }).data;
+      if (typeof data === 'string') {
+        try {
+          return JSON.parse(data) as T;
+        } catch {
+          throw new Error('内置 API 返回了无效 JSON');
+        }
+      }
+      if (data && typeof data === 'object') return data as T;
+    }
+    return payload as T;
+  }
+
+  private withLegacySession(path: string): string {
+    if (!this.legacySessionID) return path;
+    const separator = path.includes('?') ? '&' : '?';
+    return `${path}${separator}zentaosid=${encodeURIComponent(this.legacySessionID)}`;
   }
 
   /**
@@ -1603,9 +1856,8 @@ export class ZentaoClient {
    */
   private async legacyPost<T = unknown>(path: string, data: Record<string, unknown>): Promise<T> {
     await this.ensureLegacyLogin();
-    const sep = path.includes('?') ? '&' : '?';
     const response = await this.http.post(
-      `${path}${sep}${this.legacySessionName}=${this.legacySessionID}`,
+      this.withLegacySession(path),
       data,
       {
         headers: {
@@ -1627,9 +1879,8 @@ export class ZentaoClient {
    */
   private async legacyPostForm<T = unknown>(path: string, form: FormData): Promise<T> {
     await this.ensureLegacyLogin();
-    const sep = path.includes('?') ? '&' : '?';
     const response = await this.http.post(
-      `${path}${sep}${this.legacySessionName}=${this.legacySessionID}`,
+      this.withLegacySession(path),
       form,
       {
         headers: {
@@ -1671,8 +1922,9 @@ export class ZentaoClient {
         `/index.php?m=doc&f=ajaxGetDoc&docID=${docID}&version=${version}`
       );
       return data || null;
-    } catch {
-      return null;
+    } catch (error) {
+      if (this.isNotFound(error)) return null;
+      throw error;
     }
   }
 
@@ -1755,8 +2007,9 @@ export class ZentaoClient {
 
       return result.doc || null;
     } catch (error) {
-      console.error('编辑文档失败:', error);
-      return null;
+      this.logRequestError('编辑文档失败', error);
+      if (this.isNotFound(error)) return null;
+      throw error;
     }
   }
 
@@ -1811,8 +2064,9 @@ export class ZentaoClient {
       }>(`/index.php?m=doc&f=editCatalog&moduleID=${params.moduleID}&type=doc`, form);
 
       return result.result === 'success';
-    } catch {
-      return false;
+    } catch (error) {
+      this.logRequestError('编辑文档目录失败', error);
+      throw error;
     }
   }
 

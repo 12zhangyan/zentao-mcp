@@ -1,268 +1,153 @@
 # 禅道 MCP Server
 
-让 AI 助手能够直接管理禅道中的 Bug、需求和测试用例。通过 MCP (Model Context Protocol)，你可以用自然语言与 AI 交流来查询、创建、更新和关闭各种禅道数据。
+面向禅道 21.x REST API v1 与 Web JSON 接口的 MCP 服务。采用“一个业务域一个统一工具”的接口形式，支持 Bug、需求、测试用例、产品、项目、我的任务、用户和文档查询；写操作默认关闭。
 
-## ✨ 功能特性
+## 生产安全基线
 
-### Bug 管理
-- 📋 获取 Bug 列表（支持按状态筛选）
-- 🔍 查看 Bug 详情
-- ➕ 创建新 Bug
-- ✅ 解决 Bug（标记为已修复）
-- 🔒 关闭 Bug
-- 🔄 激活 Bug（重新打开）
-- ✔️ 确认 Bug
+- 凭据仅保存在当前用户目录，不写入 MCP 配置、仓库或命令行参数。
+- 默认 `allowWrites: false`，创建、编辑、解决和关闭操作会在访问禅道前被拒绝。
+- 日志只写入 `stderr`，采用结构化 JSON，并清洗密码、Token、Cookie、账号和连接地址。
+- HTTP 请求有超时、响应体上限和同源重定向限制；不读取系统代理，避免内网请求被意外转发。
+- Token 失效时只自动刷新一次；瞬时错误只重试幂等的 GET 请求，POST 不自动重放。
+- 列表数量和 MCP 单次响应大小均有硬上限，超限时显式失败。
+- 工具声明包含 MCP `readOnlyHint`、`destructiveHint`、`idempotentHint` 和 `openWorldHint`。
+- 支持 SIGINT/SIGTERM 优雅关闭，并提供不返回业务数据的健康检查。
 
-### 需求管理
-- 📋 获取需求列表（支持按状态筛选）
-- 🔍 查看需求详情
-- ➕ 创建新需求
-- 🔒 关闭需求
-- 🔄 激活需求
+> 如果禅道仅提供 HTTP，MCP 会记录 `insecure_http_transport` 警告。账号密码和 Token 在链路中仍依赖内网边界保护；生产环境建议为禅道启用 HTTPS。
 
-### 测试用例管理
-- 📋 获取测试用例列表
-- 🔍 查看测试用例详情
-- ➕ 创建测试用例
-- ✏️ 修改测试用例
-- 🗑️ 删除测试用例
+## 环境要求
 
-### 其他功能
-- 📦 获取产品列表
-- 📁 获取项目列表
-- 🔄 获取执行（迭代）列表
+- Node.js 18 或更高版本
+- 禅道开源版 16.5+；本项目已按禅道 21.x Token API 适配
+- 对目标禅道 REST API v1 的网络访问权限
 
-## 🚀 快速开始
+## 安装和配置
 
-### 方式一：使用 npx（推荐）
-
-无需安装，直接在 MCP 客户端配置中使用：
-
-#### Cursor 配置
-
-编辑 `~/.cursor/mcp.json`（Windows: `%USERPROFILE%\.cursor\mcp.json`）：
-
-```json
-{
-  "mcpServers": {
-    "zentao": {
-      "command": "npx",
-      "args": ["-y", "@tytt/zentao-mcp"],
-      "env": {
-        "ZENTAO_URL": "https://your-zentao-server.com",
-        "ZENTAO_ACCOUNT": "your_username",
-        "ZENTAO_PASSWORD": "your_password",
-        "ZENTAO_SKIP_SSL": "true"
-      }
-    }
-  }
-}
-```
-
-#### Claude Desktop 配置
-
-编辑 `claude_desktop_config.json`：
-
-```json
-{
-  "mcpServers": {
-    "zentao": {
-      "command": "npx",
-      "args": ["-y", "@tytt/zentao-mcp"],
-      "env": {
-        "ZENTAO_URL": "https://your-zentao-server.com",
-        "ZENTAO_ACCOUNT": "your_username",
-        "ZENTAO_PASSWORD": "your_password",
-        "ZENTAO_SKIP_SSL": "true"
-      }
-    }
-  }
-}
-```
-
-### 方式二：全局安装
+从源码部署：
 
 ```bash
-npm install -g @tytt/zentao-mcp
+npm ci
+npm run setup
+npm run verify
 ```
 
-然后在 MCP 配置中使用：
+`npm run setup` 会在交互式终端中隐藏密码输入，并将配置写入：
+
+- Windows：`%USERPROFILE%\.zentao-mcp\config.json`
+- macOS/Linux：`~/.zentao-mcp/config.json`
+
+也可复用已有的 `~/.zentao-weekly/config.json`。如果需要指定其他本地文件，只在 MCP 进程中设置 `ZENTAO_CONFIG_PATH`，不要设置账号、密码或 Token 环境变量。
+
+配置示例（只使用脱敏占位符）：
 
 ```json
 {
-  "mcpServers": {
-    "zentao": {
-      "command": "zentao-mcp",
-      "env": {
-        "ZENTAO_URL": "https://your-zentao-server.com",
-        "ZENTAO_ACCOUNT": "your_username",
-        "ZENTAO_PASSWORD": "your_password",
-        "ZENTAO_SKIP_SSL": "true"
-      }
-    }
+  "zentao": {
+    "baseUrl": "https://zentao.example.local/zentao",
+    "account": "YOUR_ACCOUNT",
+    "password": "YOUR_PASSWORD",
+    "skipSsl": false,
+    "allowWrites": false,
+    "timeoutMs": 30000,
+    "maxRetries": 2,
+    "maxPageSize": 100,
+    "maxResponseChars": 200000
   }
 }
 ```
 
-### 方式三：从源码运行
+配置约束：
 
-1. 克隆项目并安装依赖：
+- `baseUrl` 必须是禅道部署根地址并保留子路径，例如 `/zentao`；不能填写 `my-work-*.html` 页面。
+- URL 只允许 HTTP/HTTPS，不允许内嵌凭据、查询参数或片段。
+- `skipSsl` 仅用于可信内网中的自签名证书，生产环境优先配置可信 CA。
+- 只有明确接受写入风险时才将 `allowWrites` 改为 `true`。
+- `timeoutMs`：1000–120000；`maxRetries`：0–5；`maxPageSize`：1–500；`maxResponseChars`：10000–1000000。
 
-```bash
-git clone https://github.com/Tytt/zentao-mcp.git
-cd zentao-mcp
-npm install
-npm run build
-```
+## MCP 客户端配置
 
-2. 在 MCP 配置中使用本地路径：
+本地源码方式：
 
 ```json
 {
   "mcpServers": {
     "zentao": {
       "command": "node",
-      "args": ["/path/to/zentao-mcp/dist/index.js"],
+      "args": ["D:/develop/zentao-mcp/dist/bundle.cjs"]
+    }
+  }
+}
+```
+
+如配置文件不在默认位置：
+
+```json
+{
+  "mcpServers": {
+    "zentao": {
+      "command": "node",
+      "args": ["D:/develop/zentao-mcp/dist/bundle.cjs"],
       "env": {
-        "ZENTAO_URL": "https://your-zentao-server.com",
-        "ZENTAO_ACCOUNT": "your_username",
-        "ZENTAO_PASSWORD": "your_password",
-        "ZENTAO_SKIP_SSL": "true"
+        "ZENTAO_CONFIG_PATH": "D:/secure-config/zentao-mcp.json"
       }
     }
   }
 }
 ```
 
-## ⚙️ 环境变量说明
+## MCP 工具
 
-| 变量名 | 必填 | 说明 |
-|-------|------|------|
-| `ZENTAO_URL` | ✅ | 禅道服务器地址（包含协议，如 `https://zentao.example.com`） |
-| `ZENTAO_ACCOUNT` | ✅ | 禅道登录账号 |
-| `ZENTAO_PASSWORD` | ✅ | 禅道登录密码 |
-| `ZENTAO_SKIP_SSL` | ❌ | 是否跳过 SSL 证书验证（自签名证书时设为 `true`） |
+| 工具 | 只读 action | 写 action |
+|---|---|---|
+| `zentao_bugs` | `list`, `view` | `create`, `resolve`, `close` |
+| `zentao_stories` | `list`, `view` | `create`, `close` |
+| `zentao_testcases` | `list`, `view` | `create` |
+| `zentao_products` | `list`, `view` | — |
+| `zentao_projects` | `list`, `view` | — |
+| `zentao_tasks` | `my`, `execution`, `view` | — |
+| `zentao_users` | `list`, `view`, `me` | — |
+| `zentao_docs` | `tree`, `view` | `create`, `edit`, `createModule`, `editModule` |
+| `zentao_system` | `health` | — |
 
-## 💬 使用示例
+`zentao_system` 的 `health` 仅验证鉴权和 API 可达性，返回服务版本、读写模式和 TLS 状态，不返回用户资料或业务内容。
 
-配置完成后，你可以用自然语言与 AI 交流来管理禅道：
+`zentao_tasks` 的 `my` 对应禅道 `my-work-task-*.html` 页面，`browseType` 可选 `assignedTo`（默认）、`finishedBy`、`closedBy`。该工具复用本地账号建立 Cookie 会话，但不会把 Cookie 写入磁盘或日志。
 
-### Bug 相关
-
-```
-> "帮我看下有哪些 Bug 还没修复"
-> "查看 Bug #123 的详细信息"
-> "我已经修复了 Bug #123，帮我关闭它"
-> "在产品 1 创建一个 Bug：登录页面按钮点击无响应"
-```
-
-### 需求相关
-
-```
-> "列出产品 1 的需求"
-> "有哪些正在进行中的需求？"
-> "创建一个新需求：用户登录功能优化"
-```
-
-### 测试用例相关
-
-```
-> "帮我看下有哪些测试用例"
-> "创建一个登录功能的测试用例"
-> "删除测试用例 #5"
-```
-
-## 🛠️ 可用工具列表
-
-### Bug 管理
-
-| 工具名称 | 描述 |
-|---------|------|
-| `zentao_get_bugs` | 获取 Bug 列表，支持状态筛选 |
-| `zentao_get_active_bugs` | 获取未解决的 Bug 列表 |
-| `zentao_get_assigned_bugs` | 获取指派给某人的 Bug |
-| `zentao_get_bug` | 获取 Bug 详情 |
-| `zentao_create_bug` | 创建新 Bug |
-| `zentao_resolve_bug` | 解决 Bug |
-| `zentao_close_bug` | 关闭 Bug |
-| `zentao_activate_bug` | 激活 Bug |
-| `zentao_confirm_bug` | 确认 Bug |
-
-### 需求管理
-
-| 工具名称 | 描述 |
-|---------|------|
-| `zentao_get_stories` | 获取需求列表 |
-| `zentao_get_active_stories` | 获取进行中的需求 |
-| `zentao_get_story` | 获取需求详情 |
-| `zentao_create_story` | 创建新需求 |
-| `zentao_close_story` | 关闭需求 |
-| `zentao_activate_story` | 激活需求 |
-
-### 测试用例管理
-
-| 工具名称 | 描述 |
-|---------|------|
-| `zentao_get_testcases` | 获取测试用例列表 |
-| `zentao_get_testcase` | 获取测试用例详情 |
-| `zentao_create_testcase` | 创建测试用例 |
-| `zentao_update_testcase` | 修改测试用例 |
-| `zentao_delete_testcase` | 删除测试用例 |
-
-### 产品和项目
-
-| 工具名称 | 描述 |
-|---------|------|
-| `zentao_get_products` | 获取产品列表 |
-| `zentao_get_projects` | 获取项目列表 |
-| `zentao_get_executions` | 获取执行列表 |
-
-## 📝 状态说明
-
-### Bug 状态
-
-| 状态 | 描述 |
-|------|------|
-| `active` | 未解决/激活状态 |
-| `resolved` | 已解决，待验证 |
-| `closed` | 已关闭 |
-
-### 需求状态
-
-| 状态 | 描述 |
-|------|------|
-| `draft` | 草稿 |
-| `active` | 激活/进行中 |
-| `changed` | 已变更 |
-| `reviewing` | 评审中 |
-| `closed` | 已关闭 |
-
-### 测试用例状态
-
-| 状态 | 描述 |
-|------|------|
-| `wait` | 待评审 |
-| `normal` | 正常 |
-| `blocked` | 被阻塞 |
-| `investigate` | 研究中 |
-
-## ⚠️ 注意事项
-
-1. **API 版本**：本项目基于禅道 REST API v1 开发，适用于禅道 12.x 及以上版本
-2. **权限**：确保配置的账号有足够的权限进行相应操作
-3. **SSL 证书**：如果禅道使用自签名证书，需要设置 `ZENTAO_SKIP_SSL=true`
-4. **密码安全**：不要将配置文件提交到公开的版本控制系统
-
-## 🔧 发布到 npm（维护者）
+## 运维与验证
 
 ```bash
-# 登录 npm
-npm login
+# 构建和全部自动化测试
+npm test
 
-# 发布
-npm publish --access public
+# 生产依赖漏洞扫描
+npm run audit:prod
+
+# 测试、漏洞扫描和发布包内容检查
+npm run verify
 ```
 
-## 📄 License
+诊断日志为逐行 JSON，可按 `event` 检索：
+
+- `server_started` / `server_stopping`
+- `tool_call_started` / `tool_call_succeeded` / `tool_call_failed`
+- `auth_token_refreshed`
+- `http_request_retry`
+- `write_action_blocked`
+- `insecure_http_transport`
+
+仓库中的 `test-doc-api.ts` 是只读诊断脚本，只返回可达性和数量摘要，不创建、编辑或输出禅道业务内容。
+
+## 发布检查
+
+发布前至少执行：
+
+```bash
+npm ci
+npm run verify
+```
+
+真实配置文件、`.env`、响应转储、日志和任何凭据都不得进入发布包或版本控制。
+
+## License
 
 MIT

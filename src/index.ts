@@ -4,40 +4,6 @@
  * 提供 Bug 和需求的增删改查工具给 AI 使用
  */
 
-// 重写 stdout/stderr，过滤非 MCP 协议的输出（如 npx/dotenv 的日志）
-const originalStdoutWrite = process.stdout.write.bind(process.stdout);
-const originalStderrWrite = process.stderr.write.bind(process.stderr);
-
-/** 检查是否为 MCP 协议消息 */
-const isMcpMessage = (str: string): boolean => {
-  const trimmed = str.trimStart();
-  return trimmed.startsWith('{') || trimmed.startsWith('Content-Length:');
-};
-
-// stdout: 只允许 MCP 协议消息通过，其他静默丢弃
-process.stdout.write = (chunk: any, encodingOrCallback?: any, callback?: any): boolean => {
-  const str = typeof chunk === 'string' ? chunk : chunk.toString();
-  if (isMcpMessage(str)) {
-    return originalStdoutWrite(chunk, encodingOrCallback, callback);
-  }
-  // 静默丢弃非协议消息
-  if (typeof encodingOrCallback === 'function') encodingOrCallback();
-  else if (callback) callback();
-  return true;
-};
-
-// stderr: 过滤掉 dotenv 等第三方库的输出
-process.stderr.write = (chunk: any, encodingOrCallback?: any, callback?: any): boolean => {
-  const str = typeof chunk === 'string' ? chunk : chunk.toString();
-  // 过滤掉 dotenv 的日志
-  if (str.includes('dotenv') || str.includes('injecting env') || str.includes('dotenvx')) {
-    if (typeof encodingOrCallback === 'function') encodingOrCallback();
-    else if (callback) callback();
-    return true;
-  }
-  return originalStderrWrite(chunk, encodingOrCallback, callback);
-};
-
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -46,6 +12,14 @@ import {
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import dotenv from 'dotenv';
+import { loadZentaoConfig } from './config.js';
+import { SafeLogger } from './logger.js';
+import { redactSensitiveText } from './redaction.js';
+import {
+  isWriteAction,
+  resolveLimit,
+  serializeToolResult,
+} from './runtime-policy.js';
 import { ZentaoClient } from './zentao-client.js';
 import {
   BugType,
@@ -53,34 +27,42 @@ import {
   TestCaseType,
   TestCaseStep,
   StoryCategory,
+  ZentaoConfig,
 } from './types.js';
 
-// 加载环境变量
-dotenv.config();
+const SERVER_NAME = 'zentao-mcp';
+const SERVER_VERSION = '1.1.0';
 
-// 验证必需的环境变量
-const ZENTAO_URL = process.env.ZENTAO_URL;
-const ZENTAO_ACCOUNT = process.env.ZENTAO_ACCOUNT;
-const ZENTAO_PASSWORD = process.env.ZENTAO_PASSWORD;
-/** 是否跳过SSL证书验证（自签名证书时设为 'true'） */
-const ZENTAO_SKIP_SSL = process.env.ZENTAO_SKIP_SSL === 'true';
+// 环境变量仅用于指定本地配置文件路径，不再承载账号密码。
+dotenv.config({ quiet: true });
 
-if (!ZENTAO_URL || !ZENTAO_ACCOUNT || !ZENTAO_PASSWORD) {
-  console.error('错误: 请设置以下环境变量:');
-  console.error('  ZENTAO_URL - 禅道服务器地址');
-  console.error('  ZENTAO_ACCOUNT - 禅道用户名');
-  console.error('  ZENTAO_PASSWORD - 禅道密码');
-  console.error('  ZENTAO_SKIP_SSL - 是否跳过SSL验证（可选，自签名证书时设为 true）');
+let zentaoConfig: ZentaoConfig;
+try {
+  zentaoConfig = loadZentaoConfig();
+} catch (error) {
+  process.stderr.write(`${JSON.stringify({
+    timestamp: new Date().toISOString(),
+    level: 'error',
+    event: 'config_load_failed',
+    message: redactSensitiveText(error),
+  })}\n`);
   process.exit(1);
+  throw error;
 }
 
 // 创建禅道客户端
-const zentaoClient = new ZentaoClient({
-  url: ZENTAO_URL,
-  account: ZENTAO_ACCOUNT,
-  password: ZENTAO_PASSWORD,
-  rejectUnauthorized: ZENTAO_SKIP_SSL ? false : undefined,
-});
+const zentaoClient = new ZentaoClient(zentaoConfig);
+const sensitiveValues = [
+  zentaoConfig.url,
+  zentaoConfig.account,
+  zentaoConfig.password,
+];
+const logger = new SafeLogger(sensitiveValues);
+if (zentaoConfig.url.startsWith('http://')) {
+  logger.log('warn', 'insecure_http_transport', {
+    message: '当前禅道连接未使用 TLS，传输安全依赖内网边界',
+  });
+}
 
 // ==================== 工具定义 ====================
 
@@ -89,6 +71,12 @@ const tools: Tool[] = [
   {
     name: 'zentao_bugs',
     description: 'Bug 操作。支持：查询列表、查询详情、创建、解决、关闭',
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -105,7 +93,12 @@ const tools: Tool[] = [
           enum: ['all', 'unclosed', 'unresolved', 'toclosed', 'openedbyme', 'assigntome', 'resolvedbyme', 'assigntonull'],
           description: '浏览类型(list): all-全部, unclosed-未关闭(默认), unresolved-未解决, toclosed-待关闭, openedbyme-我创建, assigntome-指派给我, resolvedbyme-我解决, assigntonull-未指派',
         },
-        limit: { type: 'number', description: '返回数量限制，默认 20' },
+        limit: {
+          type: 'number',
+          minimum: 1,
+          maximum: zentaoConfig.maxPageSize,
+          description: `返回数量限制，默认 20，最大 ${zentaoConfig.maxPageSize}`,
+        },
         // 创建参数
         title: { type: 'string', description: 'Bug 标题（create 时必填）' },
         severity: { type: 'number', enum: [1, 2, 3, 4], description: '严重程度: 1-致命, 2-严重, 3-一般, 4-轻微' },
@@ -137,6 +130,12 @@ const tools: Tool[] = [
   {
     name: 'zentao_stories',
     description: '需求操作。支持：查询列表、查询详情、创建、关闭',
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -153,7 +152,12 @@ const tools: Tool[] = [
           enum: ['allstory', 'unclosed', 'draftstory', 'activestory', 'reviewingstory', 'changingstory', 'closedstory', 'openedbyme', 'assignedtome', 'reviewbyme'],
           description: '浏览类型(list): allstory-全部, unclosed-未关闭(默认), draftstory-草稿, activestory-激活, reviewingstory-评审中, changingstory-变更中, closedstory-已关闭, openedbyme-我创建, assignedtome-指派给我, reviewbyme-我评审',
         },
-        limit: { type: 'number', description: '返回数量限制，默认 20' },
+        limit: {
+          type: 'number',
+          minimum: 1,
+          maximum: zentaoConfig.maxPageSize,
+          description: `返回数量限制，默认 20，最大 ${zentaoConfig.maxPageSize}`,
+        },
         // 创建参数
         title: { type: 'string', description: '需求标题（create 时必填）' },
         category: {
@@ -178,7 +182,7 @@ const tools: Tool[] = [
 
 【信息来源】相关文档/截图/旧需求链接/接口文档链接`,
         },
-        reviewer: { type: 'array', items: { type: 'string' }, description: '评审人账号列表（create 时必填），如 ["york", "admin"]' },
+        reviewer: { type: 'array', items: { type: 'string' }, description: '评审人账号列表（create 时必填），如 ["reviewer1", "reviewer2"]' },
         verify: { type: 'string', description: '验收标准' },
         estimate: { type: 'number', description: '预估工时（小时）' },
         module: { type: 'number', description: '模块 ID' },
@@ -198,6 +202,12 @@ const tools: Tool[] = [
   {
     name: 'zentao_testcases',
     description: '测试用例操作。支持：查询列表、查询详情、创建',
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -209,7 +219,12 @@ const tools: Tool[] = [
         // 查询参数
         caseID: { type: 'number', description: '用例 ID（view 时使用）' },
         productID: { type: 'number', description: '产品 ID（list/create 时使用）' },
-        limit: { type: 'number', description: '返回数量限制，默认 100' },
+        limit: {
+          type: 'number',
+          minimum: 1,
+          maximum: zentaoConfig.maxPageSize,
+          description: `返回数量限制，默认 100，最大 ${zentaoConfig.maxPageSize}`,
+        },
         // 创建参数
         title: { type: 'string', description: '用例标题（create 时必填）' },
         type: {
@@ -241,6 +256,12 @@ const tools: Tool[] = [
   {
     name: 'zentao_products',
     description: '产品操作。支持：查询列表、查询详情',
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -250,7 +271,12 @@ const tools: Tool[] = [
           description: '操作类型: list-列表, view-详情',
         },
         productID: { type: 'number', description: '产品 ID（view 时使用）' },
-        limit: { type: 'number', description: '返回数量限制，默认 100' },
+        limit: {
+          type: 'number',
+          minimum: 1,
+          maximum: zentaoConfig.maxPageSize,
+          description: `返回数量限制，默认 100，最大 ${zentaoConfig.maxPageSize}`,
+        },
       },
       required: ['action'],
     },
@@ -260,6 +286,12 @@ const tools: Tool[] = [
   {
     name: 'zentao_projects',
     description: '项目操作。支持：查询列表、查询详情',
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -269,7 +301,48 @@ const tools: Tool[] = [
           description: '操作类型: list-列表, view-详情',
         },
         projectID: { type: 'number', description: '项目 ID（view 时使用）' },
-        limit: { type: 'number', description: '返回数量限制，默认 100' },
+        limit: {
+          type: 'number',
+          minimum: 1,
+          maximum: zentaoConfig.maxPageSize,
+          description: `返回数量限制，默认 100，最大 ${zentaoConfig.maxPageSize}`,
+        },
+      },
+      required: ['action'],
+    },
+  },
+
+  // 任务工具
+  {
+    name: 'zentao_tasks',
+    description: '只读任务查询。支持：我的任务、执行任务列表、任务详情',
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['my', 'execution', 'view'],
+          description: '操作类型: my-我的任务, execution-执行任务列表, view-任务详情',
+        },
+        browseType: {
+          type: 'string',
+          enum: ['assignedTo', 'finishedBy', 'closedBy'],
+          description: '我的任务类型: assignedTo-指派给我(默认), finishedBy-由我完成, closedBy-由我关闭',
+        },
+        executionID: { type: 'number', description: '执行 ID（execution 时必填）' },
+        taskID: { type: 'number', description: '任务 ID（view 时必填）' },
+        limit: {
+          type: 'number',
+          minimum: 1,
+          maximum: zentaoConfig.maxPageSize,
+          description: `返回数量限制，默认 20，最大 ${zentaoConfig.maxPageSize}`,
+        },
       },
       required: ['action'],
     },
@@ -279,6 +352,12 @@ const tools: Tool[] = [
   {
     name: 'zentao_users',
     description: '用户操作。支持：查询列表、查询详情、查询当前用户',
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -288,7 +367,35 @@ const tools: Tool[] = [
           description: '操作类型: list-列表, view-详情, me-当前用户',
         },
         userID: { type: 'number', description: '用户 ID（view 时使用）' },
-        limit: { type: 'number', description: '返回数量限制，默认 100' },
+        limit: {
+          type: 'number',
+          minimum: 1,
+          maximum: zentaoConfig.maxPageSize,
+          description: `返回数量限制，默认 100，最大 ${zentaoConfig.maxPageSize}`,
+        },
+      },
+      required: ['action'],
+    },
+  },
+
+  // 运行状态工具
+  {
+    name: 'zentao_system',
+    description: '检查 MCP 与禅道的只读连接状态，不返回账号、地址或业务数据',
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['health'],
+          description: '操作类型: health-检查连接状态',
+        },
       },
       required: ['action'],
     },
@@ -298,6 +405,12 @@ const tools: Tool[] = [
   {
     name: 'zentao_docs',
     description: '文档操作。支持：获取文档空间树、获取文档详情、创建/编辑文档、创建/编辑目录',
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -332,8 +445,8 @@ const tools: Tool[] = [
 
 const server = new Server(
   {
-    name: 'zentao-mcp',
-    version: '1.0.0',
+    name: SERVER_NAME,
+    version: SERVER_VERSION,
   },
   {
     capabilities: {
@@ -348,11 +461,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 // 处理工具调用
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+  const { name } = request.params;
+  const args = request.params.arguments ?? {};
+  const action = (args as Record<string, unknown>).action;
+  const startedAt = Date.now();
 
   try {
-    let result: unknown;
+    if (extra.signal.aborted) {
+      return { content: [{ type: 'text', text: '操作已取消' }], isError: true };
+    }
+    if (!zentaoConfig.allowWrites && isWriteAction(name, action)) {
+      logger.log('warn', 'write_action_blocked', { tool: name, action });
+      return {
+        content: [{
+          type: 'text',
+          text: '当前为只读模式；如确需写入，请在本地配置中显式设置 allowWrites: true',
+        }],
+        isError: true,
+      };
+    }
+
+    return await zentaoClient.withAbortSignal(extra.signal, async () => {
+      logger.log('info', 'tool_call_started', { tool: name, action });
+      let result: unknown;
 
     switch (name) {
       // Bug 操作
@@ -386,7 +518,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (!productID) {
               return { content: [{ type: 'text', text: '缺少必要参数: productID' }], isError: true };
             }
-            result = await zentaoClient.getBugs(productID, browseType, limit);
+            result = await zentaoClient.getBugs(
+              productID,
+              browseType,
+              resolveLimit(limit, zentaoConfig.maxPageSize ?? 100, 20),
+            );
             break;
 
           case 'view':
@@ -462,7 +598,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (!productID) {
               return { content: [{ type: 'text', text: '缺少必要参数: productID' }], isError: true };
             }
-            result = await zentaoClient.getStories(productID, browseType, limit);
+            result = await zentaoClient.getStories(
+              productID,
+              browseType,
+              resolveLimit(limit, zentaoConfig.maxPageSize ?? 100, 20),
+            );
             break;
 
           case 'view':
@@ -524,7 +664,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (!productID) {
               return { content: [{ type: 'text', text: '缺少必要参数: productID' }], isError: true };
             }
-            result = await zentaoClient.getTestCases(productID, limit);
+            result = await zentaoClient.getTestCases(
+              productID,
+              resolveLimit(limit, zentaoConfig.maxPageSize ?? 100),
+            );
             break;
 
           case 'view':
@@ -562,7 +705,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         switch (action) {
           case 'list':
-            result = await zentaoClient.getProducts(limit);
+            result = await zentaoClient.getProducts(
+              resolveLimit(limit, zentaoConfig.maxPageSize ?? 100),
+            );
             break;
 
           case 'view':
@@ -591,7 +736,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         switch (action) {
           case 'list':
-            result = await zentaoClient.getProjects(limit);
+            result = await zentaoClient.getProjects(
+              resolveLimit(limit, zentaoConfig.maxPageSize ?? 100),
+            );
             break;
 
           case 'view':
@@ -601,6 +748,50 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             result = await zentaoClient.getProject(projectID);
             if (!result) {
               return { content: [{ type: 'text', text: `项目 #${projectID} 不存在或无权限查看` }], isError: true };
+            }
+            break;
+
+          default:
+            return { content: [{ type: 'text', text: `未知操作类型: ${action}` }], isError: true };
+        }
+        break;
+      }
+
+      // 任务操作
+      case 'zentao_tasks': {
+        const { action, browseType, executionID, taskID, limit } = args as {
+          action: string;
+          browseType?: 'assignedTo' | 'finishedBy' | 'closedBy';
+          executionID?: number;
+          taskID?: number;
+          limit?: number;
+        };
+
+        switch (action) {
+          case 'my':
+            result = await zentaoClient.getMyTasks(
+              browseType,
+              resolveLimit(limit, zentaoConfig.maxPageSize ?? 100, 20),
+            );
+            break;
+
+          case 'execution':
+            if (!executionID) {
+              return { content: [{ type: 'text', text: '缺少必要参数: executionID' }], isError: true };
+            }
+            result = await zentaoClient.getTasks(
+              executionID,
+              resolveLimit(limit, zentaoConfig.maxPageSize ?? 100, 20),
+            );
+            break;
+
+          case 'view':
+            if (!taskID) {
+              return { content: [{ type: 'text', text: '缺少必要参数: taskID' }], isError: true };
+            }
+            result = await zentaoClient.getTask(taskID);
+            if (!result) {
+              return { content: [{ type: 'text', text: `任务 #${taskID} 不存在或无权限查看` }], isError: true };
             }
             break;
 
@@ -620,7 +811,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         switch (action) {
           case 'list':
-            result = await zentaoClient.getUsers(limit);
+            result = await zentaoClient.getUsers(
+              resolveLimit(limit, zentaoConfig.maxPageSize ?? 100),
+            );
             break;
 
           case 'view':
@@ -643,6 +836,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           default:
             return { content: [{ type: 'text', text: `未知操作类型: ${action}` }], isError: true };
         }
+        break;
+      }
+
+      // 运行状态
+      case 'zentao_system': {
+        const { action } = args as { action: string };
+        if (action !== 'health') {
+          return { content: [{ type: 'text', text: `未知操作类型: ${action}` }], isError: true };
+        }
+        const profile = await zentaoClient.getMyProfile();
+        result = {
+          status: profile ? 'ok' : 'degraded',
+          serverVersion: SERVER_VERSION,
+          mode: zentaoConfig.allowWrites ? 'read-write' : 'read-only',
+          transportSecurity: zentaoConfig.url.startsWith('https://') ? 'tls' : 'insecure-http',
+        };
         break;
       }
 
@@ -750,9 +959,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: `未知工具: ${name}` }], isError: true };
     }
 
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    const text = serializeToolResult(result, zentaoConfig.maxResponseChars ?? 200_000);
+    logger.log('info', 'tool_call_succeeded', {
+      tool: name,
+      action,
+      durationMs: Date.now() - startedAt,
+      responseChars: text.length,
+    });
+      return { content: [{ type: 'text', text }] };
+    });
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : '未知错误';
+    const errorMessage = redactSensitiveText(
+      error instanceof Error ? error.message : '未知错误',
+      sensitiveValues,
+    );
+    logger.log('error', 'tool_call_failed', {
+      tool: name,
+      action,
+      durationMs: Date.now() - startedAt,
+      message: errorMessage,
+    });
     return { content: [{ type: 'text', text: `操作失败: ${errorMessage}` }], isError: true };
   }
 });
@@ -762,9 +988,39 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  logger.log('info', 'server_started', {
+    name: SERVER_NAME,
+    version: SERVER_VERSION,
+    mode: zentaoConfig.allowWrites ? 'read-write' : 'read-only',
+  });
 }
 
+let shuttingDown = false;
+async function shutdown(reason: string, exitCode: number): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.log('info', 'server_stopping', { reason, exitCode });
+  try {
+    await server.close();
+  } catch (error) {
+    logger.log('error', 'server_close_failed', { message: error });
+    exitCode = 1;
+  }
+  process.exitCode = exitCode;
+}
+
+process.once('SIGINT', () => void shutdown('SIGINT', 0));
+process.once('SIGTERM', () => void shutdown('SIGTERM', 0));
+process.once('uncaughtException', (error) => {
+  logger.log('error', 'uncaught_exception', { message: error });
+  void shutdown('uncaughtException', 1);
+});
+process.once('unhandledRejection', (error) => {
+  logger.log('error', 'unhandled_rejection', { message: error });
+  void shutdown('unhandledRejection', 1);
+});
+
 main().catch((error) => {
-  console.error('启动失败:', error);
-  process.exit(1);
+  logger.log('error', 'server_start_failed', { message: error });
+  void shutdown('startupFailure', 1);
 });

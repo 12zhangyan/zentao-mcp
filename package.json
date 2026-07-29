@@ -1,13 +1,15 @@
 {
   "name": "zentao-mcp-server",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "zentao-mcp": "dist/bundle.cjs"
+    "zentao-mcp": "dist/bundle.cjs",
+    "zentao-mcp-setup": "scripts/setup-config.mjs"
   },
   "files": [
     "dist",
+    "scripts/setup-config.mjs",
     "README.md",
     "env.example",
     ".npmrc"
@@ -15,10 +17,13 @@
   "scripts": {
     "build": "tsc && npm run bundle",
     "bundle": "esbuild dist/index.js --bundle --platform=node --target=node18 --outfile=dist/bundle.cjs --format=cjs",
-    "start": "node dist/bundle.js",
+    "start": "node dist/bundle.cjs",
     "dev": "ts-node --esm src/index.ts",
+    "setup": "node scripts/setup-config.mjs",
     "prepublishOnly": "npm run build",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "npm run build && node --test tests/zentao-client.test.mjs tests/config.test.mjs tests/redaction.test.mjs tests/runtime-policy.test.mjs",
+    "audit:prod": "npm audit --omit=dev",
+    "verify": "npm test && npm run audit:prod && npm pack --dry-run --json"
   },
   "keywords": [
     "mcp",
@@ -38,13 +43,20 @@
     "type": "git",
     "url": "https://github.com/Tytt/zentao-mcp.git"
   },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "axios": "^1.18.1",
+    "dotenv": "^17.2.3"
+  },
+  "overrides": {
+    "@hono/node-server": "^2.0.12",
+    "ajv": "^8.20.0",
+    "fast-uri": "^3.1.4",
+    "form-data": "^4.0.6",
+    "hono": "^4.12.32"
+  },
   "devDependencies": {
-    "@modelcontextprotocol/sdk": "^1.25.2",
-    "@types/crypto-js": "^4.2.2",
     "@types/node": "^25.0.9",
-    "axios": "^1.13.2",
-    "crypto-js": "^4.2.0",
-    "dotenv": "^17.2.3",
     "esbuild": "^0.27.2",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
