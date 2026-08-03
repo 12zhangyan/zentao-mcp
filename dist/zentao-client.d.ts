@@ -2,7 +2,7 @@
  * 禅道 API 客户端
  * 封装禅道 REST API 的调用，支持 Bug 和需求的增删改查
  */
-import { ZentaoConfig, Bug, Story, Product, Project, CreateBugParams, ResolveBugParams, CloseBugParams, ActivateBugParams, UpdateBugParams, CreateStoryParams, CloseStoryParams, UpdateStoryParams, ChangeStoryParams, TestCase, TestCaseListResponse, CreateTestCaseParams, Task, CreateTaskParams, UpdateTaskParams, User, CreateUserParams, UpdateUserParams, Program, CreateProgramParams, UpdateProgramParams, Plan, CreatePlanParams, UpdatePlanParams, Release, Build, CreateBuildParams, UpdateBuildParams, Execution, CreateExecutionParams, UpdateExecutionParams, CreateProductParams, UpdateProductParams, CreateProjectParams, UpdateProjectParams, Doc, DocSpaceData, CreateDocParams, EditDocParams, CreateDocModuleParams, EditDocModuleParams } from './types.js';
+import { ZentaoConfig, Bug, Story, Product, Project, CreateBugParams, ResolveBugParams, CloseBugParams, ActivateBugParams, UpdateBugParams, CreateStoryParams, CloseStoryParams, UpdateStoryParams, ChangeStoryParams, TestCase, TestCaseListResponse, CreateTestCaseParams, Task, MyTaskPage, CreateTaskParams, UpdateTaskParams, User, CreateUserParams, UpdateUserParams, Program, CreateProgramParams, UpdateProgramParams, Plan, CreatePlanParams, UpdatePlanParams, Release, Build, CreateBuildParams, UpdateBuildParams, Execution, CreateExecutionParams, UpdateExecutionParams, CreateProductParams, UpdateProductParams, CreateProjectParams, UpdateProjectParams, Doc, DocSpaceData, CreateDocParams, EditDocParams, CreateDocModuleParams, EditDocModuleParams } from './types.js';
 /**
  * 禅道 API 客户端类
  * 提供与禅道系统交互的所有方法
@@ -241,6 +241,13 @@ export declare class ZentaoClient {
      * @param limit - 返回数量限制
      */
     getMyTasks(browseType?: 'assignedTo' | 'finishedBy' | 'closedBy', limit?: number): Promise<Task[]>;
+    /**
+     * 分页获取当前用户的任务。对外分页独立于禅道 Web 页大小，调用方可安全遍历全部结果。
+     * @param browseType - assignedTo-指派给我，finishedBy-由我完成，closedBy-由我关闭
+     * @param page - 从 1 开始的页码
+     * @param limit - 每页返回数量
+     */
+    getMyTasksPage(browseType?: 'assignedTo' | 'finishedBy' | 'closedBy', page?: number, limit?: number): Promise<MyTaskPage>;
     private normalizeLegacyTasks;
     /**
      * 获取任务详情

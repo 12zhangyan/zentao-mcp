@@ -945,21 +945,58 @@ export class ZentaoClient {
      * @param limit - 返回数量限制
      */
     async getMyTasks(browseType = 'assignedTo', limit = 100) {
+        const result = await this.getMyTasksPage(browseType, 1, limit);
+        return result.tasks;
+    }
+    /**
+     * 分页获取当前用户的任务。对外分页独立于禅道 Web 页大小，调用方可安全遍历全部结果。
+     * @param browseType - assignedTo-指派给我，finishedBy-由我完成，closedBy-由我关闭
+     * @param page - 从 1 开始的页码
+     * @param limit - 每页返回数量
+     */
+    async getMyTasksPage(browseType = 'assignedTo', page = 1, limit = 50) {
+        if (!Number.isInteger(page) || page < 1)
+            throw new Error('page 必须是大于等于 1 的整数');
+        if (!Number.isInteger(limit) || limit < 1)
+            throw new Error('limit 必须是大于等于 1 的整数');
         const first = await this.legacyGet(`/my-work-task-${browseType}.json`);
-        const tasks = this.normalizeLegacyTasks(first.tasks);
-        if (tasks.length >= limit)
-            return tasks.slice(0, limit);
-        const recTotal = Number(first.pager?.recTotal ?? tasks.length);
-        const recPerPage = Number(first.pager?.recPerPage ?? (tasks.length || 20));
-        const pageTotal = Math.max(1, Number(first.pager?.pageTotal ?? 1));
-        for (let pageID = 2; pageID <= pageTotal && tasks.length < limit; pageID += 1) {
-            const page = await this.legacyGet(`/my-work-task-${browseType}--id_desc-${recTotal}-${recPerPage}-${pageID}.json`);
-            const pageTasks = this.normalizeLegacyTasks(page.tasks);
-            if (pageTasks.length === 0)
-                break;
-            tasks.push(...pageTasks);
+        const firstTasks = this.normalizeLegacyTasks(first.tasks);
+        const rawTotal = Number(first.pager?.recTotal ?? firstTasks.length);
+        const rawPageSize = Number(first.pager?.recPerPage ?? (firstTasks.length || 20));
+        const rawPageTotal = Number(first.pager?.pageTotal ?? 1);
+        const recTotal = Number.isFinite(rawTotal) && rawTotal >= 0 ? rawTotal : firstTasks.length;
+        const recPerPage = Number.isFinite(rawPageSize) && rawPageSize >= 1 ? rawPageSize : (firstTasks.length || 20);
+        const pageTotal = Number.isFinite(rawPageTotal) && rawPageTotal >= 1 ? rawPageTotal : 1;
+        const offset = (page - 1) * limit;
+        if (offset >= recTotal) {
+            return { page, limit, total: recTotal, hasMore: false, tasks: [] };
         }
-        return tasks.slice(0, limit);
+        const firstSourcePage = Math.floor(offset / recPerPage) + 1;
+        const lastSourcePage = Math.min(pageTotal, Math.ceil(Math.min(recTotal, offset + limit) / recPerPage));
+        const collected = [];
+        for (let pageID = firstSourcePage; pageID <= lastSourcePage; pageID += 1) {
+            if (pageID === 1) {
+                collected.push(...firstTasks);
+                continue;
+            }
+            const sourcePage = await this.legacyGet(`/my-work-task-${browseType}--id_desc-${recTotal}-${recPerPage}-${pageID}.json`);
+            const sourceTasks = this.normalizeLegacyTasks(sourcePage.tasks);
+            if (sourceTasks.length === 0)
+                break;
+            collected.push(...sourceTasks);
+        }
+        const withinCollected = offset - (firstSourcePage - 1) * recPerPage;
+        const tasks = collected.slice(withinCollected, withinCollected + limit);
+        if (tasks.length === 0 && offset < recTotal) {
+            throw new Error(`禅道任务分页元数据不一致（page=${page}, limit=${limit}, total=${recTotal}）`);
+        }
+        return {
+            page,
+            limit,
+            total: recTotal,
+            hasMore: offset + tasks.length < recTotal,
+            tasks,
+        };
     }
     normalizeLegacyTasks(value) {
         if (Array.isArray(value))

@@ -33227,6 +33227,80 @@ var StdioServerTransport = class {
 // dist/index.js
 var import_dotenv = __toESM(require_main(), 1);
 
+// package.json
+var package_default = {
+  name: "@yanzhang123/zentao-mcp",
+  version: "1.2.0",
+  type: "module",
+  main: "dist/index.js",
+  bin: {
+    "zentao-mcp": "dist/bundle.cjs",
+    "zentao-mcp-setup": "scripts/setup-config.mjs"
+  },
+  files: [
+    "dist",
+    "scripts/setup-config.mjs",
+    "README.md",
+    "env.example",
+    ".npmrc"
+  ],
+  scripts: {
+    build: "tsc && npm run bundle",
+    bundle: "esbuild dist/index.js --bundle --platform=node --target=node18 --outfile=dist/bundle.cjs --format=cjs",
+    start: "node dist/bundle.cjs",
+    dev: "ts-node --esm src/index.ts",
+    setup: "node scripts/setup-config.mjs",
+    prepublishOnly: "npm run build",
+    test: "npm run build && node --test tests/zentao-client.test.mjs tests/config.test.mjs tests/redaction.test.mjs tests/runtime-policy.test.mjs",
+    "audit:prod": "npm audit --omit=dev",
+    verify: "npm test && npm run audit:prod && npm pack --dry-run --json"
+  },
+  keywords: [
+    "mcp",
+    "zentao",
+    "bug-tracking",
+    "ai-assistant",
+    "cursor",
+    "model-context-protocol"
+  ],
+  author: "yanzhang123",
+  license: "MIT",
+  description: "\u7985\u9053 MCP Server - \u8BA9 AI \u52A9\u624B\u80FD\u591F\u7BA1\u7406\u7985\u9053\u4E2D\u7684 Bug\u3001\u9700\u6C42\u548C\u6D4B\u8BD5\u7528\u4F8B",
+  engines: {
+    node: ">=18.0.0"
+  },
+  repository: {
+    type: "git",
+    url: "git+https://github.com/12zhangyan/zentao-mcp.git"
+  },
+  homepage: "https://github.com/12zhangyan/zentao-mcp#readme",
+  bugs: {
+    url: "https://github.com/12zhangyan/zentao-mcp/issues"
+  },
+  publishConfig: {
+    access: "public",
+    registry: "https://registry.npmjs.org/"
+  },
+  dependencies: {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    axios: "^1.18.1",
+    dotenv: "^17.2.3"
+  },
+  overrides: {
+    "@hono/node-server": "^2.0.12",
+    ajv: "^8.20.0",
+    "fast-uri": "^3.1.4",
+    "form-data": "^4.0.6",
+    hono: "^4.12.32"
+  },
+  devDependencies: {
+    "@types/node": "^25.0.9",
+    esbuild: "^0.27.2",
+    "ts-node": "^10.9.2",
+    typescript: "^5.9.3"
+  }
+};
+
 // dist/config.js
 var import_node_fs = __toESM(require("node:fs"), 1);
 var import_node_os = __toESM(require("node:os"), 1);
@@ -33370,6 +33444,39 @@ function resolveLimit(value, maximum, fallback = 100) {
     throw new Error(`limit \u5FC5\u987B\u662F 1-${maximum} \u7684\u6574\u6570`);
   }
   return value;
+}
+function resolvePage(value, fallback = 1) {
+  if (value === void 0)
+    return fallback;
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error("page \u5FC5\u987B\u662F\u5927\u4E8E\u7B49\u4E8E 1 \u7684\u6574\u6570");
+  }
+  return value;
+}
+function compactTask(task) {
+  const keys = [
+    "id",
+    "name",
+    "project",
+    "execution",
+    "type",
+    "status",
+    "estimate",
+    "consumed",
+    "assignedTo",
+    "realStarted",
+    "finishedBy",
+    "finishedDate",
+    "closedBy",
+    "closedDate"
+  ];
+  const compact = {};
+  for (const key of keys) {
+    const value = task[key];
+    if (value !== void 0)
+      compact[key] = value;
+  }
+  return compact;
 }
 function serializeToolResult(result, maximumChars) {
   const text = JSON.stringify(result, null, 2);
@@ -39219,21 +39326,58 @@ var ZentaoClient = class {
    * @param limit - 返回数量限制
    */
   async getMyTasks(browseType = "assignedTo", limit = 100) {
+    const result = await this.getMyTasksPage(browseType, 1, limit);
+    return result.tasks;
+  }
+  /**
+   * 分页获取当前用户的任务。对外分页独立于禅道 Web 页大小，调用方可安全遍历全部结果。
+   * @param browseType - assignedTo-指派给我，finishedBy-由我完成，closedBy-由我关闭
+   * @param page - 从 1 开始的页码
+   * @param limit - 每页返回数量
+   */
+  async getMyTasksPage(browseType = "assignedTo", page = 1, limit = 50) {
+    if (!Number.isInteger(page) || page < 1)
+      throw new Error("page \u5FC5\u987B\u662F\u5927\u4E8E\u7B49\u4E8E 1 \u7684\u6574\u6570");
+    if (!Number.isInteger(limit) || limit < 1)
+      throw new Error("limit \u5FC5\u987B\u662F\u5927\u4E8E\u7B49\u4E8E 1 \u7684\u6574\u6570");
     const first = await this.legacyGet(`/my-work-task-${browseType}.json`);
-    const tasks = this.normalizeLegacyTasks(first.tasks);
-    if (tasks.length >= limit)
-      return tasks.slice(0, limit);
-    const recTotal = Number(first.pager?.recTotal ?? tasks.length);
-    const recPerPage = Number(first.pager?.recPerPage ?? (tasks.length || 20));
-    const pageTotal = Math.max(1, Number(first.pager?.pageTotal ?? 1));
-    for (let pageID = 2; pageID <= pageTotal && tasks.length < limit; pageID += 1) {
-      const page = await this.legacyGet(`/my-work-task-${browseType}--id_desc-${recTotal}-${recPerPage}-${pageID}.json`);
-      const pageTasks = this.normalizeLegacyTasks(page.tasks);
-      if (pageTasks.length === 0)
-        break;
-      tasks.push(...pageTasks);
+    const firstTasks = this.normalizeLegacyTasks(first.tasks);
+    const rawTotal = Number(first.pager?.recTotal ?? firstTasks.length);
+    const rawPageSize = Number(first.pager?.recPerPage ?? (firstTasks.length || 20));
+    const rawPageTotal = Number(first.pager?.pageTotal ?? 1);
+    const recTotal = Number.isFinite(rawTotal) && rawTotal >= 0 ? rawTotal : firstTasks.length;
+    const recPerPage = Number.isFinite(rawPageSize) && rawPageSize >= 1 ? rawPageSize : firstTasks.length || 20;
+    const pageTotal = Number.isFinite(rawPageTotal) && rawPageTotal >= 1 ? rawPageTotal : 1;
+    const offset = (page - 1) * limit;
+    if (offset >= recTotal) {
+      return { page, limit, total: recTotal, hasMore: false, tasks: [] };
     }
-    return tasks.slice(0, limit);
+    const firstSourcePage = Math.floor(offset / recPerPage) + 1;
+    const lastSourcePage = Math.min(pageTotal, Math.ceil(Math.min(recTotal, offset + limit) / recPerPage));
+    const collected = [];
+    for (let pageID = firstSourcePage; pageID <= lastSourcePage; pageID += 1) {
+      if (pageID === 1) {
+        collected.push(...firstTasks);
+        continue;
+      }
+      const sourcePage = await this.legacyGet(`/my-work-task-${browseType}--id_desc-${recTotal}-${recPerPage}-${pageID}.json`);
+      const sourceTasks = this.normalizeLegacyTasks(sourcePage.tasks);
+      if (sourceTasks.length === 0)
+        break;
+      collected.push(...sourceTasks);
+    }
+    const withinCollected = offset - (firstSourcePage - 1) * recPerPage;
+    const tasks = collected.slice(withinCollected, withinCollected + limit);
+    if (tasks.length === 0 && offset < recTotal) {
+      throw new Error(`\u7985\u9053\u4EFB\u52A1\u5206\u9875\u5143\u6570\u636E\u4E0D\u4E00\u81F4\uFF08page=${page}, limit=${limit}, total=${recTotal}\uFF09`);
+    }
+    return {
+      page,
+      limit,
+      total: recTotal,
+      hasMore: offset + tasks.length < recTotal,
+      tasks
+    };
   }
   normalizeLegacyTasks(value) {
     if (Array.isArray(value))
@@ -40239,7 +40383,7 @@ var ZentaoClient = class {
 
 // dist/index.js
 var SERVER_NAME = "zentao-mcp";
-var SERVER_VERSION = "1.1.0";
+var SERVER_VERSION = package_default.version;
 import_dotenv.default.config({ quiet: true });
 var zentaoConfig;
 try {
@@ -40538,6 +40682,15 @@ var tools = [
           minimum: 1,
           maximum: zentaoConfig.maxPageSize,
           description: `\u8FD4\u56DE\u6570\u91CF\u9650\u5236\uFF0C\u9ED8\u8BA4 20\uFF0C\u6700\u5927 ${zentaoConfig.maxPageSize}`
+        },
+        page: {
+          type: "number",
+          minimum: 1,
+          description: "my \u5206\u9875\u9875\u7801\uFF0C\u4ECE 1 \u5F00\u59CB\uFF1B\u63D0\u4F9B\u540E\u8FD4\u56DE\u542B total/hasMore/tasks \u7684\u5206\u9875\u5BF9\u8C61"
+        },
+        compact: {
+          type: "boolean",
+          description: "my \u5206\u9875\u65F6\u4EC5\u8FD4\u56DE\u6279\u91CF\u5F52\u6863\u6240\u9700\u5B57\u6BB5\uFF0C\u63A8\u8350\u5468\u62A5\u62C9\u53D6\u4F7F\u7528"
         }
       },
       required: ["action"]
@@ -40858,10 +41011,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         }
         // 任务操作
         case "zentao_tasks": {
-          const { action: action2, browseType, executionID, taskID, limit } = args;
+          const { action: action2, browseType, executionID, taskID, limit, page, compact } = args;
           switch (action2) {
             case "my":
-              result = await zentaoClient.getMyTasks(browseType, resolveLimit(limit, zentaoConfig.maxPageSize ?? 100, 20));
+              if (page !== void 0 || compact === true) {
+                const taskPage = await zentaoClient.getMyTasksPage(browseType, resolvePage(page), resolveLimit(limit, zentaoConfig.maxPageSize ?? 100, 50));
+                result = {
+                  ...taskPage,
+                  compact: compact === true,
+                  tasks: compact === true ? taskPage.tasks.map(compactTask) : taskPage.tasks
+                };
+              } else {
+                result = await zentaoClient.getMyTasks(browseType, resolveLimit(limit, zentaoConfig.maxPageSize ?? 100, 20));
+              }
               break;
             case "execution":
               if (!executionID) {

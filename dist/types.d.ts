@@ -417,6 +417,31 @@ export interface Task {
     closedDate?: string;
     progress?: number;
 }
+/** “我的任务”分页结果，避免大列表一次性占满 MCP 响应。 */
+export interface MyTaskPage {
+    page: number;
+    limit: number;
+    total: number;
+    hasMore: boolean;
+    tasks: Task[];
+}
+/** 周报等批量读取场景使用的精简任务字段。 */
+export interface CompactTask {
+    id: number;
+    name: string;
+    project: Task['project'];
+    execution: Task['execution'];
+    type: Task['type'];
+    status: Task['status'];
+    estimate?: number;
+    consumed?: number;
+    assignedTo?: Task['assignedTo'];
+    realStarted?: string;
+    finishedBy?: string;
+    finishedDate?: string;
+    closedBy?: string;
+    closedDate?: string;
+}
 /** 鍒涘缓浠诲姟鍙傛暟 */
 export interface CreateTaskParams {
     /** 鎵ц ID */

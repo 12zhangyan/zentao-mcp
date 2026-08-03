@@ -7,13 +7,14 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema, } from '@modelcontextprotocol/sdk/types.js';
 import dotenv from 'dotenv';
+import packageJson from '../package.json' with { type: 'json' };
 import { loadZentaoConfig } from './config.js';
 import { SafeLogger } from './logger.js';
 import { redactSensitiveText } from './redaction.js';
-import { isWriteAction, resolveLimit, serializeToolResult, } from './runtime-policy.js';
+import { isWriteAction, compactTask, resolveLimit, resolvePage, serializeToolResult, } from './runtime-policy.js';
 import { ZentaoClient } from './zentao-client.js';
 const SERVER_NAME = 'zentao-mcp';
-const SERVER_VERSION = '1.1.0';
+const SERVER_VERSION = packageJson.version;
 // 环境变量仅用于指定本地配置文件路径，不再承载账号密码。
 dotenv.config({ quiet: true });
 let zentaoConfig;
@@ -316,6 +317,15 @@ const tools = [
                     maximum: zentaoConfig.maxPageSize,
                     description: `返回数量限制，默认 20，最大 ${zentaoConfig.maxPageSize}`,
                 },
+                page: {
+                    type: 'number',
+                    minimum: 1,
+                    description: 'my 分页页码，从 1 开始；提供后返回含 total/hasMore/tasks 的分页对象',
+                },
+                compact: {
+                    type: 'boolean',
+                    description: 'my 分页时仅返回批量归档所需字段，推荐周报拉取使用',
+                },
             },
             required: ['action'],
         },
@@ -614,10 +624,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
                 }
                 // 任务操作
                 case 'zentao_tasks': {
-                    const { action, browseType, executionID, taskID, limit } = args;
+                    const { action, browseType, executionID, taskID, limit, page, compact } = args;
                     switch (action) {
                         case 'my':
-                            result = await zentaoClient.getMyTasks(browseType, resolveLimit(limit, zentaoConfig.maxPageSize ?? 100, 20));
+                            if (page !== undefined || compact === true) {
+                                const taskPage = await zentaoClient.getMyTasksPage(browseType, resolvePage(page), resolveLimit(limit, zentaoConfig.maxPageSize ?? 100, 50));
+                                result = {
+                                    ...taskPage,
+                                    compact: compact === true,
+                                    tasks: compact === true
+                                        ? taskPage.tasks.map(compactTask)
+                                        : taskPage.tasks,
+                                };
+                            }
+                            else {
+                                result = await zentaoClient.getMyTasks(browseType, resolveLimit(limit, zentaoConfig.maxPageSize ?? 100, 20));
+                            }
                             break;
                         case 'execution':
                             if (!executionID) {

@@ -144,6 +144,14 @@ npm 方式：
 
 `zentao_tasks` 的 `my` 对应禅道 `my-work-task-*.html` 页面，`browseType` 可选 `assignedTo`（默认）、`finishedBy`、`closedBy`。该工具复用本地账号建立 Cookie 会话，但不会把 Cookie 写入磁盘或日志。
 
+批量归档或周报场景不要依赖单次大 `limit`。传入 `page` 后返回 `{page, limit, total, hasMore, tasks}`；再配合 `compact: true` 去掉描述等大字段，按 `hasMore` 翻页即可完整读取且不触发响应字符上限：
+
+```json
+{"action":"my","browseType":"finishedBy","page":1,"limit":50,"compact":true}
+```
+
+未传 `page` 且未启用 `compact` 时仍返回原任务数组，保持向后兼容。
+
 ## 运维与验证
 
 ```bash

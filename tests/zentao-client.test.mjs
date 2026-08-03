@@ -350,6 +350,65 @@ test('禅道 21.x 我的任务接口可解包 data 字符串和对象型任务�
   assert.notEqual(loginBody.password, 'plain-secret');
 });
 
+test('我的任务支持稳定外部分页，不因单次响应上限截断更早任务', async () => {
+  const sourceTasks = (start, end) => Object.fromEntries(
+    Array.from({ length: end - start + 1 }, (_, index) => {
+      const id = start + index;
+      return [String(id), { id, name: `任务${id}`, status: 'done' }];
+    }),
+  );
+  const requestedPages = [];
+  await withServer(
+    async (request, response) => {
+      response.setHeader('Content-Type', 'application/json');
+      if (request.method === 'GET' && request.url === '/zentao/user-login.json') {
+        response.setHeader('Set-Cookie', 'zentaosid=sid; Path=/');
+        response.end(JSON.stringify({ data: JSON.stringify({ rand: 123 }) }));
+        return;
+      }
+      if (request.method === 'GET' && request.url === '/zentao/user-refreshRandom.json') {
+        response.end('456');
+        return;
+      }
+      if (request.method === 'POST' && request.url === '/zentao/user-login.json') {
+        response.end(JSON.stringify({ status: 'success', user: { account: 'tester' } }));
+        return;
+      }
+      if (request.url === '/zentao/my-work-task-finishedBy.json') {
+        response.end(JSON.stringify({
+          data: JSON.stringify({
+            tasks: sourceTasks(1, 20),
+            pager: { recTotal: 60, recPerPage: 20, pageTotal: 3 },
+          }),
+        }));
+        return;
+      }
+      const match = request.url?.match(/finishedBy--id_desc-60-20-(\d+)\.json$/);
+      if (match) {
+        const sourcePage = Number(match[1]);
+        requestedPages.push(sourcePage);
+        const start = (sourcePage - 1) * 20 + 1;
+        response.end(JSON.stringify({
+          data: JSON.stringify({ tasks: sourceTasks(start, start + 19) }),
+        }));
+        return;
+      }
+      response.statusCode = 404;
+      response.end(JSON.stringify({ error: 'not found' }));
+    },
+    async (url) => {
+      const client = new ZentaoClient({ url, account: 'tester', password: 'fake-secret' });
+      const result = await client.getMyTasksPage('finishedBy', 2, 25);
+      assert.equal(result.page, 2);
+      assert.equal(result.limit, 25);
+      assert.equal(result.total, 60);
+      assert.equal(result.hasMore, true);
+      assert.deepEqual(result.tasks.map((task) => task.id), Array.from({ length: 25 }, (_, i) => i + 26));
+    },
+  );
+  assert.deepEqual(requestedPages, [2, 3]);
+});
+
 test('HTTP 重定向只允许留在禅道同源地址', async () => {
   await withServer(
     (request, response) => {
